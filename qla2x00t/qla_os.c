@@ -644,7 +644,7 @@ qla2x00_sp_free_dma(void *vha, void *ptr)
 		ctx1 = NULL;
 	}
 
-	CMD_SP(cmd) = NULL;
+	sp->type = 0;
 	mempool_free(sp, ha->srb_mempool);
 }
 
@@ -750,7 +750,6 @@ static int qla2xxx_queuecommand_lck(struct scsi_cmnd *cmd)
 	sp->u.scmd.cmd = cmd;
 	sp->type = SRB_SCSI_CMD;
 	atomic_set(&sp->ref_count, 1);
-	CMD_SP(cmd) = (void *)sp;
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0)
 	cmd->scsi_done = done;
 #endif
@@ -807,6 +806,7 @@ qla2x00_eh_wait_on_command(struct scsi_cmnd *cmd)
 	unsigned long wait_iter = ABORT_WAIT_ITER;
 	scsi_qla_host_t *vha = shost_priv(cmd->device->host);
 	struct qla_hw_data *ha = vha->hw;
+	srb_t *sp = scsi_cmd_priv(cmd);
 	int ret = QLA_SUCCESS;
 
 	if (unlikely(pci_channel_offline(ha->pdev)) || ha->flags.eeh_busy) {
@@ -815,10 +815,10 @@ qla2x00_eh_wait_on_command(struct scsi_cmnd *cmd)
 		return ret;
 	}
 
-	while (CMD_SP(cmd) && wait_iter--) {
+	while (sp->type && wait_iter--) {
 		msleep(ABORT_POLLING_PERIOD);
 	}
-	if (CMD_SP(cmd))
+	if (sp->type)
 		ret = QLA_FUNCTION_FAILED;
 
 	return ret;
@@ -971,9 +971,6 @@ qla2xxx_eh_abort(struct scsi_cmnd *cmd)
 	int wait = 0;
 	struct qla_hw_data *ha = vha->hw;
 
-	if (!CMD_SP(cmd))
-		return SUCCESS;
-
 	ret = fc_block_scsi_eh(cmd);
 	if (ret != SUCCESS && ret != 0)
 		return ret;
@@ -984,7 +981,7 @@ qla2xxx_eh_abort(struct scsi_cmnd *cmd)
 	lun = cmd->device->lun;
 
 	spin_lock_irqsave(&ha->hardware_lock, flags);
-	sp = (srb_t *) CMD_SP(cmd);
+	sp = scsi_cmd_priv(cmd);
 	if (!sp) {
 		spin_unlock_irqrestore(&ha->hardware_lock, flags);
 		return SUCCESS;
@@ -1012,7 +1009,7 @@ qla2xxx_eh_abort(struct scsi_cmnd *cmd)
 	spin_unlock_irqrestore(&ha->hardware_lock, flags);
 
 	/* Did the command return during mailbox execution? */
-	if (ret == FAILED && !CMD_SP(cmd))
+	if (ret == FAILED && !sp->type)
 		ret = SUCCESS;
 
 	/* Wait for the command to be returned. */
@@ -1518,7 +1515,7 @@ qla2x00_config_dma_addressing(struct qla_hw_data *ha)
 	if (!dma_set_mask(&ha->pdev->dev, DMA_BIT_MASK(64))) {
 		/* Any upper-dword bits set? */
 		if (MSD(dma_get_required_mask(&ha->pdev->dev)) &&
-		    !pci_set_consistent_dma_mask(ha->pdev, DMA_BIT_MASK(64))) {
+		    !dma_set_coherent_mask(&ha->pdev->dev, DMA_BIT_MASK(64))) {
 			/* Ok, a 64bit DMA mask is applicable. */
 			ha->enable_64bit_addressing = 1;
 			ha->isp_ops->calc_req_entries = qla2x00_calc_iocbs_64;
@@ -1528,7 +1525,7 @@ qla2x00_config_dma_addressing(struct qla_hw_data *ha)
 	}
 
 	dma_set_mask(&ha->pdev->dev, DMA_BIT_MASK(32));
-	pci_set_consistent_dma_mask(ha->pdev, DMA_BIT_MASK(32));
+	dma_set_coherent_mask(&ha->pdev->dev, DMA_BIT_MASK(32));
 }
 
 static void
