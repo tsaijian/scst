@@ -178,27 +178,49 @@ static inline unsigned int scst_blk_rq_cpu(struct request *rq)
 #endif
 }
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 17, 0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 19, 0)
 /*
- * See also commit b84ba30b6c7a ("block: remove the gendisk argument to
- * blk_execute_rq") # v5.17.
+ * See also commit e2e530867245 ("blk-mq: remove the done argument to
+ * blk_execute_rq_nowait") # v5.19.
  */
 static inline
-void blk_execute_rq_nowait_backport(struct request *rq, bool at_head,
-				    rq_end_io_fn *done)
+void blk_execute_rq_nowait_backport(struct request *rq, bool at_head)
 {
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 12, 0)
 	/*
 	 * See also commit 8eeed0b554b9 ("block: remove unnecessary argument from
 	 * blk_execute_rq_nowait") # v5.12.
 	 */
-	blk_execute_rq_nowait(rq->q, NULL, rq, at_head, done);
+	blk_execute_rq_nowait(rq->q, NULL, rq, at_head, NULL);
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(5, 17, 0)
+	/*
+	 * See also commit b84ba30b6c7a ("block: remove the gendisk argument to
+	 * blk_execute_rq") # v5.17.
+	 */
+	blk_execute_rq_nowait(NULL, rq, at_head, NULL);
 #else
-	blk_execute_rq_nowait(NULL, rq, at_head, done);
+	blk_execute_rq_nowait(rq, at_head, NULL);
 #endif
 }
 
 #define blk_execute_rq_nowait blk_execute_rq_nowait_backport
+#endif
+
+/* <linux/blkdev.h> */
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 19, 0)
+/*
+ * See also commit 44abff2c0b97 ("block: decouple REQ_OP_SECURE_ERASE
+ * from REQ_OP_DISCARD") # v5.19.
+ */
+static inline
+int blkdev_issue_discard_backport(struct block_device *bdev, sector_t sector,
+		sector_t nr_sects, gfp_t gfp_mask)
+{
+	return blkdev_issue_discard(bdev, sector, nr_sects, gfp_mask, 0);
+}
+
+#define blkdev_issue_discard blkdev_issue_discard_backport
 #endif
 
 /* <linux/byteorder/generic.h> */
@@ -751,6 +773,30 @@ static inline void kvfree(void *addr)
 }
 #endif
 
+/* <linux/shrinker.h> */
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0)
+/*
+ * See also commit e33c267ab70d ("mm: shrinkers: provide shrinkers with
+ * names") # v6.0.
+ */
+static inline
+int register_shrinker_backport(struct shrinker *shrinker, const char *fmt, ...)
+{
+/*
+ * See also commit 1d3d4437eae1 ("vmscan: per-node deferred work") # v3.12
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 12, 0)
+	return register_shrinker(shrinker);
+#else
+	register_shrinker(shrinker);
+	return 0;
+#endif
+}
+
+#define register_shrinker register_shrinker_backport
+#endif
+
 /* <linux/module.h> */
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
 #define MODULE_IMPORT_NS(ns)
@@ -820,7 +866,7 @@ struct nvmefc_fcp_req {
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 18, 0) &&	\
 	(!defined(RHEL_MAJOR) || RHEL_MAJOR -0 < 7)
-typedef unsigned percpu_count_t;
+typedef unsigned int percpu_count_t;
 #define READ_REF_COUNT(ref) atomic_read(&(ref)->count)
 #else
 typedef unsigned long percpu_count_t;
@@ -1291,38 +1337,6 @@ iov_iter_kvec_backport(struct iov_iter *i, unsigned int direction,
 
 /* <linux/unaligned.h> */
 
-#if defined(RHEL_MAJOR) && RHEL_MAJOR -0 <= 5
-static inline uint16_t get_unaligned_be16(const void *p)
-{
-	return be16_to_cpu(get_unaligned((__be16 *)p));
-}
-
-static inline void put_unaligned_be16(uint16_t i, void *p)
-{
-	put_unaligned(cpu_to_be16(i), (__be16 *)p);
-}
-
-static inline uint32_t get_unaligned_be32(const void *p)
-{
-	return be32_to_cpu(get_unaligned((__be32 *)p));
-}
-
-static inline void put_unaligned_be32(uint32_t i, void *p)
-{
-	put_unaligned(cpu_to_be32(i), (__be32 *)p);
-}
-
-static inline uint64_t get_unaligned_be64(const void *p)
-{
-	return be64_to_cpu(get_unaligned((__be64 *)p));
-}
-
-static inline void put_unaligned_be64(uint64_t i, void *p)
-{
-	put_unaligned(cpu_to_be64(i), (__be64 *)p);
-}
-#endif
-
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 7, 0) && \
 	(!defined(RHEL_MAJOR) || RHEL_MAJOR -0 < 8 ||	\
 	 RHEL_MAJOR -0 == 8 && RHEL_MINOR -0 < 4)
@@ -1444,6 +1458,9 @@ static inline void scsi_build_sense(struct scsi_cmnd *scmd, int desc,
 #endif
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
+
+#if (!defined(RHEL_RELEASE_CODE) || \
+	RHEL_RELEASE_CODE -0 != RHEL_RELEASE_VERSION(8, 7))
 /*
  * See also 51f3a4788928 ("scsi: core: Introduce the scsi_cmd_to_rq()
  * function").
@@ -1452,6 +1469,7 @@ static inline struct request *scsi_cmd_to_rq(struct scsi_cmnd *scmd)
 {
 	return scmd->request;
 }
+#endif
 
 /*
  * See also commit c611529e7cd3 ("sd: Honor block layer integrity handling
@@ -1471,7 +1489,9 @@ static inline unsigned int scsi_prot_interval(struct scsi_cmnd *scmd)
  * helper") and ddd0bc756983 ("block: move ref_tag calculation func to the
  * block layer"; v4.19).
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0) || defined(RHEL_MAJOR)
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0) || \
+	(defined(RHEL_RELEASE_CODE) && \
+	 RHEL_RELEASE_CODE -0 != RHEL_RELEASE_VERSION(8, 7)))
 static inline u32 scsi_prot_ref_tag(struct scsi_cmnd *scmd)
 {
 #if defined(RHEL_MAJOR) && RHEL_MAJOR -0 == 7

@@ -41,7 +41,8 @@
 #include <linux/writeback.h>
 #include <linux/vmalloc.h>
 #include <linux/atomic.h>
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0) || \
+	(defined(RHEL_MAJOR) && RHEL_MAJOR -0 >= 9)
 #include <linux/blk-integrity.h>
 #endif
 #include <linux/kthread.h>
@@ -562,8 +563,13 @@ static void vdisk_check_tp_support(struct scst_vdisk_dev *virt_dev)
 	fd_open = true;
 
 	if (virt_dev->blockio) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 0)
+		virt_dev->dev_thin_provisioned =
+			!!bdev_max_discard_sectors(bdev);
+#else
 		virt_dev->dev_thin_provisioned =
 			blk_queue_discard(bdev_get_queue(bdev));
+#endif
 	} else {
 		virt_dev->dev_thin_provisioned = (fd->f_op->fallocate != NULL);
 	}
@@ -581,7 +587,6 @@ check:
 		if (virt_dev->thin_provisioned)
 			PRINT_INFO("Auto enable thin provisioning for device "
 				"%s", virt_dev->filename);
-
 	}
 
 	if (virt_dev->thin_provisioned) {
@@ -1380,6 +1385,43 @@ static int vdisk_reopen_fd(struct scst_vdisk_dev *virt_dev, bool read_only)
 	return vdisk_open_fd(virt_dev, read_only);
 }
 
+static int vdisk_activate_dev(struct scst_vdisk_dev *virt_dev, bool rd_only)
+{
+	int rc = 0;
+
+	virt_dev->dev_active = 1;
+
+	/*
+	 * Only re-open FD if tgt_dev_cnt is not zero,
+	 * otherwise we will leak reference.
+	 */
+	if (virt_dev->tgt_dev_cnt) {
+		rc = vdisk_open_fd(virt_dev, rd_only);
+		if (rc) {
+			PRINT_ERROR("vdev %s: Unable to open FD: rd_only=%d, rc=%d",
+				    virt_dev->name, rd_only, rc);
+			virt_dev->dev_active = 0;
+			goto out;
+		}
+	}
+
+	if (virt_dev->reexam_pending) {
+		rc = vdisk_reexamine(virt_dev);
+		WARN_ON(rc != 0);
+		virt_dev->reexam_pending = 0;
+	}
+
+out:
+	return rc;
+}
+
+static void vdisk_disable_dev(struct scst_vdisk_dev *virt_dev)
+{
+	/* Close the FD here */
+	vdisk_close_fd(virt_dev);
+	virt_dev->dev_active = 0;
+}
+
 /* Invoked with scst_mutex held, so no further locking is necessary here. */
 static int vdisk_attach_tgt(struct scst_tgt_dev *tgt_dev)
 {
@@ -1811,8 +1853,7 @@ static int vdisk_unmap_range(struct scst_cmd *cmd,
 		sector_t nr_sects = blocks << (cmd->dev->block_shift - 9);
 		gfp_t gfp = cmd->cmd_gfp_mask;
 
-		err = blkdev_issue_discard(bdev, start_sector, nr_sects, gfp,
-					   0);
+		err = blkdev_issue_discard(bdev, start_sector, nr_sects, gfp);
 		if (unlikely(err != 0)) {
 			PRINT_ERROR("blkdev_issue_discard() for "
 				"LBA %lld, blocks %lld failed: %d",
@@ -3141,9 +3182,9 @@ static void fileio_async_complete(struct kiocb *iocb, long ret
 			w->cmd = cmd;
 			schedule_work(&w->work);
 			return;
-		} else {
-			scst_set_busy(cmd);
 		}
+
+		scst_set_busy(cmd);
 	}
 	cmd->completed = 1;
 	cmd->scst_cmd_done(cmd, SCST_CMD_STATE_DEFAULT, scst_estimate_context());
@@ -5804,7 +5845,7 @@ static void vdisk_blk_add_dif(struct bio *bio, gfp_t gfp_mask,
 	}
 
 	bip = bio_integrity_alloc(bio, gfp_mask, pages);
-	if (unlikely(IS_ERR_OR_NULL(bip))) {
+	if (IS_ERR_OR_NULL(bip)) {
 		PRINT_WARNING("Allocation of %d pages for DIF tags "
 			"failed! (dev %s)", pages, dev->virt_name);
 		goto out; /* proceed without integrity */
@@ -6297,9 +6338,7 @@ static void blockio_on_alua_state_change_start(struct scst_device *dev,
 	if (!close)
 		return;
 
-	virt_dev->dev_active = 0;
-
-	vdisk_close_fd(virt_dev);
+	vdisk_disable_dev(virt_dev);
 
 	TRACE_EXIT();
 	return;
@@ -6329,23 +6368,9 @@ static void blockio_on_alua_state_change_finish(struct scst_device *dev,
 	if (!open)
 		return;
 
-	virt_dev->dev_active = 1;
-
-	/*
-	 * only reopen fd if tgt_dev_cnt is not zero, otherwise we will
-	 * leak reference.
-	 */
-	if (virt_dev->tgt_dev_cnt)
-		rc = vdisk_open_fd(virt_dev, dev->dev_rd_only);
-
-	if (rc == 0) {
-		if (virt_dev->reexam_pending) {
-			rc = vdisk_reexamine(virt_dev);
-			WARN_ON(rc != 0);
-			virt_dev->reexam_pending = 0;
-		}
-	} else {
-		PRINT_ERROR("dev %s: opening after ALUA state change to %s failed",
+	rc = vdisk_activate_dev(virt_dev, dev->dev_rd_only);
+	if (rc) {
+		PRINT_ERROR("dev %s: Activating after ALUA state change to %s failed",
 			    dev->virt_name,
 			    scst_alua_state_name(new_state));
 	}
@@ -6953,8 +6978,8 @@ static int vdev_parse_add_dev_params(struct scst_vdisk_dev *virt_dev,
 				}
 				if (dd == NULL)
 					break;
-				else
-					*dd = '|';
+
+				*dd = '|';
 				d = dd+1;
 			}
 			TRACE_DBG("DIF DEV mode %x", virt_dev->dif_mode);
@@ -8982,13 +9007,13 @@ static ssize_t vdev_sysfs_naa_id_store(struct kobject *kobj,
 	case 2 * 8:
 		if (strchr("235", buf[0]))
 			break;
-		else
-			goto out;
+
+		goto out;
 	case 2 * 16:
 		if (strchr("6", buf[0]))
 			break;
-		else
-			goto out;
+
+		goto out;
 	default:
 		goto out;
 	}
@@ -9203,36 +9228,24 @@ static int vdev_sysfs_process_active_store(
 	res = kstrtol(work->buf, 0, &dev_active);
 	if (res)
 		goto unlock;
-	res = -EINVAL;
-	if (dev_active < 0 || dev_active > 1)
+
+	if (dev_active < 0 || dev_active > 1) {
+		res = -EINVAL;
 		goto unlock;
-	if (dev_active != virt_dev->dev_active) {
-		res = 0;
-		if (dev_active == 0) {
-			/* Close the FD here */
-			vdisk_close_fd(virt_dev);
-			virt_dev->dev_active = dev_active;
-		} else {
-			/* Re-open FD if tgt_dev_cnt is not zero */
-			virt_dev->dev_active = dev_active;
-			if (virt_dev->tgt_dev_cnt)
-				res = vdisk_open_fd(virt_dev, dev->dev_rd_only);
-			if (res == 0) {
-				if (virt_dev->reexam_pending) {
-					res = vdisk_reexamine(virt_dev);
-					WARN_ON(res != 0);
-					virt_dev->reexam_pending = 0;
-				}
-			} else {
-				PRINT_ERROR("Unable to open FD on active -> "
-					"%ld (dev %s): %d", dev_active,
-					dev->virt_name, res);
-				virt_dev->dev_active = 0;
-				goto unlock;
-			}
-		}
+	}
+
+	if (dev_active == virt_dev->dev_active)
+		goto unlock;
+
+	if (dev_active == 0) {
+		vdisk_disable_dev(virt_dev);
 	} else {
-		res = 0;
+		res = vdisk_activate_dev(virt_dev, dev->dev_rd_only);
+		if (res) {
+			PRINT_ERROR("dev %s: Activating failed",
+				    dev->virt_name);
+			goto unlock;
+		}
 	}
 
 unlock:

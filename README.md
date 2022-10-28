@@ -1,3 +1,5 @@
+[![Coverity](https://img.shields.io/coverity/scan/25131.svg)](https://scan.coverity.com/projects/scst-project)
+
 # Overview
 
 This is the source code repository of the SCST project. SCST is a collection

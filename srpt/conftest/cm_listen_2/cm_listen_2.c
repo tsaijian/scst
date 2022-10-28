@@ -3,7 +3,7 @@
 
 static int __init modinit(void)
 {
-	return ib_cm_listen(NULL, 0, 0, NULL);
+	return ib_cm_listen(NULL, 0, 0);
 }
 
 module_init(modinit);

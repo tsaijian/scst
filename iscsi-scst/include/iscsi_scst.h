@@ -35,7 +35,7 @@
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
 /*
- * Backport mm_segment_t to save compability with older kernel versions.
+ * Backport mm_segment_t to save compatibility with older kernel versions.
  *
  * mm_segment_t was dropped in commit
  * 967747bbc084 ("uaccess: remove CONFIG_SET_FS") # v5.18
@@ -193,7 +193,6 @@ struct iscsi_kern_event {
 	u32 cid;
 	u32 code;
 	u32 cookie;
-	char target_name[ISCSI_NAME_LEN];
 	u32 param1_size;
 	u32 param2_size;
 };

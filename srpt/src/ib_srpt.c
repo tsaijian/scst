@@ -121,17 +121,6 @@ static int srpt_sq_size = DEF_SRPT_SQ_SIZE;
 module_param(srpt_sq_size, int, 0444);
 MODULE_PARM_DESC(srpt_sq_size, "Per-channel send queue (SQ) size.");
 
-static bool use_port_guid_in_session_name;
-module_param(use_port_guid_in_session_name, bool, 0444);
-MODULE_PARM_DESC(use_port_guid_in_session_name,
-		 "Use target port ID in the session name such that"
-		 " redundant paths between multiport systems can be masked.");
-
-static bool use_node_guid_in_target_name;
-module_param(use_node_guid_in_target_name, bool, 0444);
-MODULE_PARM_DESC(use_node_guid_in_target_name,
-		 "Use HCA node GUID as SCST target name.");
-
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0)
 static int srpt_get_u64_x(char *buffer, struct kernel_param *kp)
 #else
@@ -144,10 +133,6 @@ module_param_call(srpt_service_guid, NULL, srpt_get_u64_x, &srpt_service_guid,
 		  0444);
 MODULE_PARM_DESC(srpt_service_guid,
 		 "Using this value for ioc_guid, id_ext, and cm_listen_id instead of using the node_guid of the first HCA.");
-
-static unsigned int max_sge_delta;
-module_param(max_sge_delta, uint, 0444);
-MODULE_PARM_DESC(max_sge_delta, "Number to subtract from max_sge (obsolete).");
 
 /*
  * Note: changing any of the two constants below into SCST_CONTEXT_DIRECT is
@@ -4418,9 +4403,12 @@ static int srpt_add_one(struct ib_device *device)
 	 * in the system as service_id; therefore, the target_id will change
 	 * if this HCA is gone bad and replaced by different HCA
 	 */
-	ret = ib_cm_listen(sdev->cm_id, cpu_to_be64(srpt_service_guid), 0
+	ret = ib_cm_listen(sdev->cm_id, cpu_to_be64(srpt_service_guid)
 #ifdef IB_CM_LISTEN_TAKES_FOURTH_ARG
+			   , 0
 			   , NULL
+#elif defined(IB_CM_LISTEN_TAKES_THIRD_ARG)
+			   , 0
 #endif
 			   );
 	if (ret) {

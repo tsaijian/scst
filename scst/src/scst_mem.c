@@ -1456,11 +1456,8 @@ out_del:
 
 out_free:
 	for (i = 0; i < pool->max_caches; i++) {
-		if (pool->caches[i]) {
-			kmem_cache_destroy(pool->caches[i]);
-			pool->caches[i] = NULL;
-		} else
-			break;
+		kmem_cache_destroy(pool->caches[i]);
+		pool->caches[i] = NULL;
 	}
 	goto out;
 }
@@ -1522,6 +1519,9 @@ static void sgv_pool_destroy(struct sgv_pool *pool)
 
 	TRACE_ENTRY();
 
+	if (unlikely(!pool))
+		goto out;
+
 	sgv_pool_flush(pool);
 
 	mutex_lock(&sgv_pools_mutex);
@@ -1537,13 +1537,13 @@ static void sgv_pool_destroy(struct sgv_pool *pool)
 	cancel_delayed_work_sync(&pool->sgv_purge_work);
 
 	for (i = 0; i < pool->max_caches; i++) {
-		if (pool->caches[i])
-			kmem_cache_destroy(pool->caches[i]);
+		kmem_cache_destroy(pool->caches[i]);
 		pool->caches[i] = NULL;
 	}
 
 	kmem_cache_free(sgv_pool_cachep, pool);
 
+out:
 	TRACE_EXIT();
 	return;
 }
@@ -1798,7 +1798,10 @@ int scst_sgv_pools_init(unsigned long mem_hwmark, unsigned long mem_lwmark)
 	sgv_shrinker.shrink = sgv_shrink;
 #endif
 	sgv_shrinker.seeks = DEFAULT_SEEKS;
-	register_shrinker(&sgv_shrinker);
+
+	res = register_shrinker(&sgv_shrinker, "scst-sgv");
+	if (unlikely(res))
+		goto out_free_per_cpu_dma;
 
 out:
 	TRACE_EXIT_RES(res);
@@ -1806,18 +1809,15 @@ out:
 
 out_free_per_cpu_dma:
 	for (i = 0; i < nr_cpu_ids; i++)
-		if (sgv_dma_pool_per_cpu[i] != NULL)
-			sgv_pool_destroy(sgv_dma_pool_per_cpu[i]);
+		sgv_pool_destroy(sgv_dma_pool_per_cpu[i]);
 
 out_free_per_cpu_clust:
 	for (i = 0; i < nr_cpu_ids; i++)
-		if (sgv_norm_clust_pool_per_cpu[i] != NULL)
-			sgv_pool_destroy(sgv_norm_clust_pool_per_cpu[i]);
+		sgv_pool_destroy(sgv_norm_clust_pool_per_cpu[i]);
 
 out_free_per_cpu_norm:
 	for (i = 0; i < nr_cpu_ids; i++)
-		if (sgv_norm_pool_per_cpu[i] != NULL)
-			sgv_pool_destroy(sgv_norm_pool_per_cpu[i]);
+		sgv_pool_destroy(sgv_norm_pool_per_cpu[i]);
 
 	sgv_pool_destroy(sgv_dma_pool_main);
 
@@ -1831,7 +1831,7 @@ out_free_pool:
 	kmem_cache_destroy(sgv_pool_cachep);
 
 out_err:
-	res = -ENOMEM;
+	res = res ?: -ENOMEM;
 	goto out;
 }
 
@@ -1845,18 +1845,15 @@ void scst_sgv_pools_deinit(void)
 
 	sgv_pool_destroy(sgv_dma_pool_main);
 	for (i = 0; i < nr_cpu_ids; i++)
-		if (sgv_dma_pool_per_cpu[i] != NULL)
-			sgv_pool_destroy(sgv_dma_pool_per_cpu[i]);
+		sgv_pool_destroy(sgv_dma_pool_per_cpu[i]);
 
 	sgv_pool_destroy(sgv_norm_pool_main);
 	for (i = 0; i < nr_cpu_ids; i++)
-		if (sgv_norm_pool_per_cpu[i] != NULL)
-			sgv_pool_destroy(sgv_norm_pool_per_cpu[i]);
+		sgv_pool_destroy(sgv_norm_pool_per_cpu[i]);
 
 	sgv_pool_destroy(sgv_norm_clust_pool_main);
 	for (i = 0; i < nr_cpu_ids; i++)
-		if (sgv_norm_clust_pool_per_cpu[i] != NULL)
-			sgv_pool_destroy(sgv_norm_clust_pool_per_cpu[i]);
+		sgv_pool_destroy(sgv_norm_clust_pool_per_cpu[i]);
 
 	for (i = 0; i < nr_cpu_ids; i++)
 		sgv_norm_pool_global[i] = NULL;

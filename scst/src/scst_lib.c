@@ -1776,15 +1776,15 @@ EXPORT_SYMBOL(scst_set_cmd_error_status);
 static int scst_set_lun_not_supported_request_sense(struct scst_cmd *cmd,
 	int key, int asc, int ascq)
 {
-	int res;
 	int sense_len, len;
 	struct scatterlist *sg;
+	int res = 0;
 
 	TRACE_ENTRY();
 
 	if (cmd->status != 0) {
-		TRACE_MGMT_DBG("cmd %p already has status %x set", cmd,
-			cmd->status);
+		TRACE_MGMT_DBG("cmd %p already has status %x set",
+			       cmd, cmd->status);
 		res = -EEXIST;
 		goto out;
 	}
@@ -1796,6 +1796,12 @@ static int scst_set_lun_not_supported_request_sense(struct scst_cmd *cmd,
 	}
 
 	if (cmd->sg == NULL) {
+		if (cmd->bufflen == 0) {
+			int bufflen = cmd->cdb[4];
+
+			cmd->bufflen = bufflen ?: 18;
+		}
+
 		/*
 		 * If target driver preparing data buffer using tgt_alloc_data_buf()
 		 * callback, it is responsible to copy the sense to its buffer
@@ -1808,19 +1814,16 @@ static int scst_set_lun_not_supported_request_sense(struct scst_cmd *cmd,
 			goto go;
 		}
 
-		if (cmd->bufflen == 0)
-			cmd->bufflen = cmd->cdb[4];
-
 		cmd->sg = scst_alloc_sg(cmd->bufflen, GFP_ATOMIC, &cmd->sg_cnt);
 		if (cmd->sg == NULL) {
-			PRINT_ERROR("Unable to alloc sg for REQUEST SENSE"
-				"(sense %x/%x/%x)", key, asc, ascq);
+			PRINT_ERROR("Unable to alloc sg for REQUEST SENSE (sense %x/%x/%x)",
+				    key, asc, ascq);
 			res = 1;
 			goto out;
 		}
 
-		TRACE_MEM("sg %p alloced for sense for cmd %p (cnt %d, "
-			"len %d)", cmd->sg, cmd, cmd->sg_cnt, cmd->bufflen);
+		TRACE_MEM("sg %p (cnt %d, len %d) alloced for sense: cmd %p",
+			  cmd->sg, cmd->sg_cnt, cmd->bufflen, cmd);
 	}
 
 go:
@@ -1837,34 +1840,37 @@ go:
 	cmd->data_direction = SCST_DATA_READ;
 	scst_set_resp_data_len(cmd, sense_len);
 
-	res = 0;
 	cmd->completed = 1;
 	cmd->resid_possible = 1;
 
 out:
 	TRACE_EXIT_RES(res);
+
 	return res;
 }
 
 static int scst_set_lun_not_supported_inquiry(struct scst_cmd *cmd)
 {
-	int res;
 	uint8_t *buf;
 	struct scatterlist *sg;
 	int len;
+	int res = 0;
 
 	TRACE_ENTRY();
 
 	if (cmd->status != 0) {
-		TRACE_MGMT_DBG("cmd %p already has status %x set", cmd,
-			cmd->status);
+		TRACE_MGMT_DBG("cmd %p already has status %x set",
+			       cmd, cmd->status);
 		res = -EEXIST;
 		goto out;
 	}
 
 	if (cmd->sg == NULL) {
-		if (cmd->bufflen == 0)
-			cmd->bufflen = min_t(int, 36, get_unaligned_be16(&cmd->cdb[3]));
+		if (cmd->bufflen == 0) {
+			int bufflen = get_unaligned_be16(&cmd->cdb[3]);
+
+			cmd->bufflen = bufflen ? min_t(int, 36, bufflen) : 36;
+		}
 
 		/*
 		 * If target driver preparing data buffer using tgt_alloc_data_buf()
@@ -1874,22 +1880,20 @@ static int scst_set_lun_not_supported_inquiry(struct scst_cmd *cmd)
 		if (cmd->tgt_i_data_buf_alloced && (cmd->tgt_i_sg != NULL)) {
 			cmd->sg = cmd->tgt_i_sg;
 			cmd->sg_cnt = cmd->tgt_i_sg_cnt;
-			TRACE_MEM("Tgt used for INQUIRY for not supported "
-				"LUN for cmd %p", cmd);
+			TRACE_MEM("Tgt used for INQUIRY (not supported LUN): cmd %p",
+				  cmd);
 			goto go;
 		}
 
 		cmd->sg = scst_alloc_sg(cmd->bufflen, GFP_ATOMIC, &cmd->sg_cnt);
 		if (cmd->sg == NULL) {
-			PRINT_ERROR("%s", "Unable to alloc sg for INQUIRY "
-				"for not supported LUN");
+			PRINT_ERROR("Unable to alloc sg for INQUIRY (not supported LUN)");
 			res = 1;
 			goto out;
 		}
 
-		TRACE_MEM("sg %p alloced for INQUIRY for not supported LUN for "
-			"cmd %p (cnt %d, len %d)", cmd->sg, cmd, cmd->sg_cnt,
-			cmd->bufflen);
+		TRACE_MEM("sg %p (cnt %d, len %d) allocated for INQUIRY (not supported LUN): cmd %p",
+			  cmd->sg, cmd->sg_cnt, cmd->bufflen, cmd);
 	}
 
 go:
@@ -1911,12 +1915,12 @@ go:
 	cmd->data_direction = SCST_DATA_READ;
 	scst_set_resp_data_len(cmd, len);
 
-	res = 0;
 	cmd->completed = 1;
 	cmd->resid_possible = 1;
 
 out:
 	TRACE_EXIT_RES(res);
+
 	return res;
 }
 
@@ -3201,11 +3205,11 @@ const char *scst_get_opcode_name(struct scst_cmd *cmd)
 {
 	if (cmd->op_name)
 		return cmd->op_name;
-	else {
-		scnprintf(cmd->not_parsed_op_name,
-			sizeof(cmd->not_parsed_op_name), "0x%x", cmd->cdb[0]);
-		return cmd->not_parsed_op_name;
-	}
+
+	scnprintf(cmd->not_parsed_op_name,
+		sizeof(cmd->not_parsed_op_name), "0x%x", cmd->cdb[0]);
+
+	return cmd->not_parsed_op_name;
 }
 EXPORT_SYMBOL(scst_get_opcode_name);
 #endif
@@ -6906,6 +6910,14 @@ enum scst_exec_res scst_cmp_wr_local(struct scst_cmd *cmd)
 		goto out_done;
 	}
 
+	if (cmd->bufflen != scst_cmd_get_expected_transfer_len_data(cmd)) {
+		PRINT_ERROR("COMPARE AND WRITE: data buffer length mismatch (CDB %u <> ini %u)",
+			    cmd->bufflen,
+			    scst_cmd_get_expected_transfer_len_data(cmd));
+		scst_set_invalid_field_in_cdb(cmd, 13/*NLB*/, 0);
+		goto out_done;
+	}
+
 	/* ToDo: HWALIGN'ed kmem_cache */
 	cwrp = kzalloc(sizeof(*cwrp), GFP_KERNEL);
 	if (cwrp == NULL) {
@@ -6916,14 +6928,6 @@ enum scst_exec_res scst_cmp_wr_local(struct scst_cmd *cmd)
 
 	cwrp->cwr_orig_cmd = cmd;
 	cwrp->cwr_finish_fn = scst_cwr_read_cmd_finished;
-
-	if (cmd->bufflen != scst_cmd_get_expected_transfer_len_data(cmd)) {
-		PRINT_ERROR("COMPARE AND WRITE: data buffer length mismatch (CDB %u <> ini %u)",
-			    cmd->bufflen,
-			    scst_cmd_get_expected_transfer_len_data(cmd));
-		scst_set_invalid_field_in_cdb(cmd, 13/*NLB*/, 0);
-		goto out_done;
-	}
 
 	/*
 	 * As required by SBC, DIF PI, if any, is not checked for the read part
@@ -7036,14 +7040,12 @@ static void scst_send_release(struct scst_device *dev)
 				       sense, 15, 0, 0);
 		TRACE_DBG("RELEASE done: %x", rc);
 
-		if (scsi_status_is_good(rc)) {
+		if (scsi_status_is_good(rc))
 			break;
-		} else {
-			PRINT_ERROR("RELEASE failed: %d", rc);
-			PRINT_BUFFER("RELEASE sense", sense, sizeof(sense));
-			scst_check_internal_sense(dev, rc, sense,
-				sizeof(sense));
-		}
+
+		PRINT_ERROR("RELEASE failed: %d", rc);
+		PRINT_BUFFER("RELEASE sense", sense, sizeof(sense));
+		scst_check_internal_sense(dev, rc, sense, sizeof(sense));
 	}
 
 out:
@@ -8073,8 +8075,7 @@ scst_alloc_passthrough_request(struct request_queue *q, int rw, gfp_t gfp_mask)
 	return blk_get_request(q, rw == READ ? REQ_OP_SCSI_IN : REQ_OP_SCSI_OUT,
 			       scst_gfp_mask_to_flags(gfp_mask));
 #else
-	return blk_mq_alloc_request(q, rw == READ ? REQ_OP_DRV_IN :
-				    rw == READ ? REQ_OP_DRV_IN : REQ_OP_DRV_OUT,
+	return blk_mq_alloc_request(q, rw == READ ? REQ_OP_DRV_IN : REQ_OP_DRV_OUT,
 				    scst_gfp_mask_to_flags(gfp_mask));
 #endif
 }
@@ -8309,7 +8310,7 @@ static struct request *blk_map_kern_sg(struct request_queue *q,
 	if (!sgl) {
 		rq = scst_alloc_passthrough_request(q, reading ? READ : WRITE,
 						    gfp);
-		if (unlikely(IS_ERR_OR_NULL(rq)))
+		if (IS_ERR_OR_NULL(rq))
 			return ERR_PTR(-ENOMEM);
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
@@ -8473,7 +8474,18 @@ out:
 	!defined(CONFIG_SUSE_KERNEL)
 static void scsi_end_async(struct request *req, int error)
 #else
-static void scsi_end_async(struct request *req, blk_status_t error)
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+/*
+ * See also commit de671d6116b5 ("block: change request end_io handler to pass
+ * back a return value") # v6.1.
+ */
+#define RQ_END_IO_RET enum rq_end_io_ret
+#else
+#define RQ_END_IO_RET void
+#endif
+
+static RQ_END_IO_RET scsi_end_async(struct request *req, blk_status_t error)
 #endif
 {
 	struct scsi_io_context *sioc = req->end_io_data;
@@ -8519,6 +8531,7 @@ static void scsi_end_async(struct request *req, blk_status_t error)
 
 	kmem_cache_free(scsi_io_context_cache, sioc);
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 21, 0) &&	\
 	(!defined(RHEL_MAJOR) || RHEL_MAJOR -0 < 8)
 	/* See also commit 92bc5a24844a ("block: remove __blk_put_request()") */
@@ -8529,6 +8542,9 @@ static void scsi_end_async(struct request *req, blk_status_t error)
 	blk_mq_free_request(req);
 #endif
 	return;
+#else
+	return RQ_END_IO_FREE;
+#endif
 }
 
 /**
@@ -8627,11 +8643,13 @@ int scst_scsi_exec_async(struct scst_cmd *cmd, void *data,
 #else
 	rq->retries = cmd->retries;
 #endif
+	rq->end_io      = scsi_end_async;
 	rq->end_io_data = sioc;
+
 	rq->cmd_flags |= REQ_FAILFAST_MASK;
 
 	blk_execute_rq_nowait(rq,
-		(cmd->queue_type == SCST_CMD_QUEUE_HEAD_OF_QUEUE), scsi_end_async);
+		(cmd->queue_type == SCST_CMD_QUEUE_HEAD_OF_QUEUE));
 out:
 	return res;
 
@@ -11406,13 +11424,12 @@ static int get_cdb_info_read_10(struct scst_cmd *cmd,
 
 	if (res != 0)
 		return res;
-	else {
+
 #ifdef CONFIG_SCST_DIF_INJECT_CORRUPTED_TAGS
-		EXTRACHECKS_BUG_ON(cmd->cdb[0] != READ_10);
-		cmd->cmd_corrupt_dif_tag = (cmd->cdb[6] & 0xE0) >> 5;
+	EXTRACHECKS_BUG_ON(cmd->cdb[0] != READ_10);
+	cmd->cmd_corrupt_dif_tag = (cmd->cdb[6] & 0xE0) >> 5;
 #endif
-		return scst_parse_rdprotect(cmd);
-	}
+	return scst_parse_rdprotect(cmd);
 }
 
 static int get_cdb_info_lba_4_len_2_wrprotect(struct scst_cmd *cmd,
@@ -11473,13 +11490,12 @@ static int get_cdb_info_read_16(struct scst_cmd *cmd,
 
 	if (res != 0)
 		return res;
-	else {
+
 #ifdef CONFIG_SCST_DIF_INJECT_CORRUPTED_TAGS
-		EXTRACHECKS_BUG_ON(cmd->cdb[0] != READ_16);
-		cmd->cmd_corrupt_dif_tag = (cmd->cdb[14] & 0xE0) >> 5;
+	EXTRACHECKS_BUG_ON(cmd->cdb[0] != READ_16);
+	cmd->cmd_corrupt_dif_tag = (cmd->cdb[14] & 0xE0) >> 5;
 #endif
-		return scst_parse_rdprotect(cmd);
-	}
+	return scst_parse_rdprotect(cmd);
 }
 
 static int get_cdb_info_lba_8_len_4_wrprotect(struct scst_cmd *cmd,

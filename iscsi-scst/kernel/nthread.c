@@ -1020,10 +1020,10 @@ void req_add_to_write_timeout_list(struct iscsi_cmnd *req)
 					&r->write_timeout_list_entry);
 				inserted = true;
 				break;
-			} else {
-				TRACE_DBG("Skipping op %x req %p (tt %ld)",
-					cmnd_opcode(r), r, tt);
 			}
+
+			TRACE_DBG("Skipping op %x req %p (tt %ld)",
+				  cmnd_opcode(r), r, tt);
 		}
 		if (!inserted) {
 			TRACE_DBG("Add NOP IN req %p in the tail", req);
@@ -1315,19 +1315,23 @@ out_err:
 			    (unsigned long long)conn->session->sid,
 			    conn->cid, conn->write_cmnd);
 	}
-	if (ref_cmd_to_parent &&
-	    ((ref_cmd->scst_cmd != NULL) || (ref_cmd->scst_aen != NULL))) {
-		if (ref_cmd->scst_state == ISCSI_CMD_STATE_AEN)
-			scst_set_aen_delivery_status(ref_cmd->scst_aen,
-				SCST_AEN_RES_FAILED);
-		else
-			scst_set_delivery_status(ref_cmd->scst_cmd,
-				SCST_CMD_DELIVERY_FAILED);
+
+	if (ref_cmd_to_parent) {
+		if (ref_cmd->scst_state == ISCSI_CMD_STATE_AEN) {
+			if (ref_cmd->scst_aen)
+				scst_set_aen_delivery_status(ref_cmd->scst_aen,
+					SCST_AEN_RES_FAILED);
+		} else {
+			if (ref_cmd->scst_cmd)
+				scst_set_delivery_status(ref_cmd->scst_cmd,
+					SCST_CMD_DELIVERY_FAILED);
+		}
 	}
+
 	goto out;
 }
 
-static int exit_tx(struct iscsi_conn *conn, int res)
+static void exit_tx(struct iscsi_conn *conn, int res)
 {
 	iscsi_extracheck_is_wr_thread(conn);
 
@@ -1351,7 +1355,8 @@ static int exit_tx(struct iscsi_conn *conn, int res)
 		mark_conn_closed(conn);
 		break;
 	}
-	return res;
+
+	return;
 }
 
 static int tx_ddigest(struct iscsi_cmnd *cmnd, int state)
@@ -1373,7 +1378,7 @@ static int tx_ddigest(struct iscsi_cmnd *cmnd, int state)
 		if (!cmnd->conn->write_size)
 			cmnd->conn->write_state = state;
 	} else
-		res = exit_tx(cmnd->conn, res);
+		exit_tx(cmnd->conn, res);
 
 	return res;
 }
@@ -1420,7 +1425,7 @@ static int tx_padding(struct iscsi_cmnd *cmnd, int state)
 		if (!cmnd->conn->write_size)
 			cmnd->conn->write_state = state;
 	} else
-		res = exit_tx(cmnd->conn, res);
+		exit_tx(cmnd->conn, res);
 
 	return res;
 }
@@ -1436,7 +1441,7 @@ static int iscsi_do_send(struct iscsi_conn *conn, int state)
 		if (!conn->write_size)
 			conn->write_state = state;
 	} else
-		res = exit_tx(conn, res);
+		exit_tx(conn, res);
 
 	return res;
 }
@@ -1505,9 +1510,6 @@ int iscsi_send(struct iscsi_conn *conn)
 			cmnd_opcode(cmnd));
 		sBUG();
 	}
-
-	if (res == 0)
-		goto out;
 
 	if (conn->write_state != TX_END)
 		goto out;
