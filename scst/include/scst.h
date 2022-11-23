@@ -1006,17 +1006,6 @@ struct scst_tgt_template {
 	void (*on_abort_cmd)(struct scst_cmd *cmd);
 
 	/*
-	 * This function should detect the target adapters that
-	 * are present in the system. The function should return a value
-	 * >= 0 to signify the number of detected target adapters.
-	 * A negative value should be returned whenever there is
-	 * an error.
-	 *
-	 * OBSOLETE
-	 */
-	int (*detect)(struct scst_tgt_template *tgt_template);
-
-	/*
 	 * This function should free up the resources allocated to the device.
 	 * The function should return 0 to indicate successful release
 	 * or a negative value if there are some issues with the release.
@@ -2838,6 +2827,9 @@ struct scst_device {
 	/* Number of commands associated with this device. */
 	atomic_t dev_cmd_count;
 #endif
+
+	/* Number of copy manager designators update requests. */
+	atomic_t cm_update_req_cnt;
 
 	/*
 	 * One more than the number of commands associated with this device

@@ -4215,6 +4215,7 @@ int scst_alloc_device(gfp_t gfp_mask, int nodeid, struct scst_device **out_dev)
 #ifdef CONFIG_SCST_PER_DEVICE_CMD_COUNT_LIMIT
 	atomic_set(&dev->dev_cmd_count, 0);
 #endif
+	atomic_set(&dev->cm_update_req_cnt, 0);
 	scst_init_mem_lim(&dev->dev_mem_lim);
 	spin_lock_init(&dev->dev_lock);
 	lockdep_register_key(&dev->dev_lock_key);
@@ -15299,9 +15300,6 @@ static void __init scst_scsi_op_list_init(void)
 	TRACE_BUFFER("scst_scsi_op_list", scst_scsi_op_list,
 		sizeof(scst_scsi_op_list));
 
-	scst_release_acg_wq = create_workqueue("scst_release_acg");
-	WARN_ON_ONCE(IS_ERR(scst_release_acg_wq));
-
 	TRACE_EXIT();
 	return;
 }
@@ -15310,27 +15308,39 @@ int __init scst_lib_init(void)
 {
 	int res = 0;
 
+	TRACE_ENTRY();
+
 	scst_scsi_op_list_init();
+
+	scst_release_acg_wq = alloc_workqueue("scst_release_acg", WQ_MEM_RECLAIM, 0);
+	if (unlikely(!scst_release_acg_wq)) {
+		PRINT_ERROR("Failed to allocate scst_release_acg_wq");
+		res = -ENOMEM;
+		goto out;
+	}
 
 	scsi_io_context_cache = kmem_cache_create("scst_scsi_io_context",
 					sizeof(struct scsi_io_context),
 					__alignof__(struct scsi_io_context),
 					SCST_SLAB_FLAGS|SLAB_HWCACHE_ALIGN, NULL);
 	if (!scsi_io_context_cache) {
-		PRINT_ERROR("%s", "Can't init scsi io context cache");
+		PRINT_ERROR("Can't init scsi io context cache");
 		res = -ENOMEM;
-		goto out;
+		goto free_wq;
 	}
 
 out:
 	TRACE_EXIT_RES(res);
 	return res;
+
+free_wq:
+	destroy_workqueue(scst_release_acg_wq);
+	goto out;
 }
 
 void scst_lib_exit(void)
 {
-	/* Wait until any ongoing acg->put_work has finished. */
-	flush_workqueue(scst_release_acg_wq);
+	/* All pending works will be drained by destroy_workqueue() */
 	destroy_workqueue(scst_release_acg_wq);
 
 	BUILD_BUG_ON(SCST_MAX_CDB_SIZE != MAX_COMMAND_SIZE);

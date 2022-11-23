@@ -2307,6 +2307,8 @@ static void scst_cm_inq_retry_fn(struct scst_cmd *cmd)
 	return;
 }
 
+static void scst_cm_update_dev_fini(struct scst_device *dev);
+
 static void scst_cm_init_inq_finish(struct scst_cmd *cmd)
 {
 	int length, page_len, off, rc;
@@ -2428,6 +2430,7 @@ out_put:
 out_put_ref:
 	percpu_ref_put(&dev->refcnt);
 
+	scst_cm_update_dev_fini(dev);
 out:
 	TRACE_EXIT();
 	return;
@@ -2541,11 +2544,28 @@ out:
 	return res;
 }
 
+static uint64_t scst_cm_get_free_lun(void)
+{
+	uint64_t lun;
+
+	while (1) {
+		lun = scst_cm_next_lun++;
+		if (lun == SCST_MAX_LUN) {
+			scst_cm_next_lun = 0;
+			continue;
+		}
+
+		if (scst_cm_is_lun_free(lun))
+			break;
+	}
+
+	return lun;
+}
+
 static int scst_cm_dev_register(struct scst_device *dev, uint64_t lun)
 {
 	int res;
 	struct scst_acg_dev *acg_dev;
-	bool add_lun;
 
 	TRACE_ENTRY();
 
@@ -2561,20 +2581,8 @@ static int scst_cm_dev_register(struct scst_device *dev, uint64_t lun)
 			goto out;
 		}
 
-		add_lun = true;
-		while (1) {
-			lun = scst_cm_next_lun++;
-			if (lun == SCST_MAX_LUN) {
-				scst_cm_next_lun = 0;
-				continue;
-			}
-			if (scst_cm_is_lun_free(lun))
-				break;
-		}
-	} else
-		add_lun = false;
+		lun = scst_cm_get_free_lun();
 
-	if (add_lun) {
 		res = scst_acg_add_lun(scst_cm_tgt->default_acg,
 			scst_cm_tgt->tgt_luns_kobj, dev, lun, SCST_ADD_LUN_CM,
 			&acg_dev);
@@ -2585,6 +2593,8 @@ static int scst_cm_dev_register(struct scst_device *dev, uint64_t lun)
 	spin_lock_bh(&dev->dev_lock);
 	scst_block_dev(dev);
 	spin_unlock_bh(&dev->dev_lock);
+
+	atomic_set(&dev->cm_update_req_cnt, 1);
 
 	res = scst_cm_send_init_inquiry(dev, lun, NULL);
 	if (res != 0)
@@ -2599,6 +2609,8 @@ out_unblock:
 	scst_unblock_dev(dev);
 	spin_unlock_bh(&dev->dev_lock);
 
+	atomic_set(&dev->cm_update_req_cnt, 0);
+
 	scst_acg_del_lun(scst_cm_tgt->default_acg, lun, false);
 
 out_err:
@@ -2606,17 +2618,13 @@ out_err:
 	goto out;
 }
 
-/* scst_mutex supposed to be held */
-static void scst_cm_dev_unregister(struct scst_device *dev, bool del_lun)
+static void scst_cm_dev_free_designators(struct scst_device *dev)
 {
 	struct scst_cm_desig *des, *t;
-	u32 lun;
 
 	TRACE_ENTRY();
 
-	lockdep_assert_held(&scst_mutex);
-
-	TRACE_DBG("dev %s, del_lun %d", dev->virt_name, del_lun);
+	mutex_lock(&scst_cm_mutex);
 
 	list_for_each_entry_safe(des, t, &scst_cm_desig_list, cm_desig_list_entry) {
 		if (des->desig_tgt_dev->dev == dev) {
@@ -2626,38 +2634,45 @@ static void scst_cm_dev_unregister(struct scst_device *dev, bool del_lun)
 		}
 	}
 
-	if (!del_lun)
-		goto out;
+	mutex_unlock(&scst_cm_mutex);
+
+	TRACE_EXIT();
+
+	return;
+}
+
+/* scst_mutex supposed to be held */
+static void scst_cm_dev_unregister(struct scst_device *dev)
+{
+	u32 lun;
+
+	TRACE_ENTRY();
+
+	lockdep_assert_held(&scst_mutex);
+
+	TRACE_DBG("Unregister CM dev %s", dev->virt_name);
+
+	scst_cm_dev_free_designators(dev);
 
 	lun = scst_cm_get_lun(dev);
 	if (lun != SCST_MAX_LUN)
 		scst_acg_del_lun(scst_cm_tgt->default_acg, lun, false);
 
-out:
 	TRACE_EXIT();
+
 	return;
 }
 
-void scst_cm_update_dev(struct scst_device *dev)
+static int __scst_cm_update_dev(struct scst_device *dev)
 {
 	unsigned int lun;
-	int rc;
+	int rc = 0;
 
 	TRACE_ENTRY();
 
 	TRACE_MGMT_DBG("copy manager: updating device %s", dev->virt_name);
 
-	if (!scst_auto_cm_assignment ||
-	    !dev->handler->auto_cm_assignment_possible)
-		goto out;
-
 	mutex_lock(&scst_mutex);
-
-	scst_cm_dev_unregister(dev, false);
-
-	spin_lock_bh(&dev->dev_lock);
-	scst_block_dev(dev);
-	spin_unlock_bh(&dev->dev_lock);
 
 	lun = scst_cm_get_lun(dev);
 	if (lun == SCST_MAX_LUN) {
@@ -2665,8 +2680,15 @@ void scst_cm_update_dev(struct scst_device *dev)
 		 * Verify that scst_unregister_virtual_device() is in progress.
 		 */
 		WARN_ON_ONCE(!dev->remove_completion);
-		goto out_unblock;
+		rc = -EINVAL;
+		goto out_unlock;
 	}
+
+	scst_cm_dev_free_designators(dev);
+
+	spin_lock_bh(&dev->dev_lock);
+	scst_block_dev(dev);
+	spin_unlock_bh(&dev->dev_lock);
 
 	rc = scst_cm_send_init_inquiry(dev, lun, NULL);
 	if (rc != 0)
@@ -2675,15 +2697,72 @@ void scst_cm_update_dev(struct scst_device *dev)
 out_unlock:
 	mutex_unlock(&scst_mutex);
 
-out:
 	TRACE_EXIT();
-	return;
+
+	return rc;
 
 out_unblock:
 	spin_lock_bh(&dev->dev_lock);
 	scst_unblock_dev(dev);
 	spin_unlock_bh(&dev->dev_lock);
+
 	goto out_unlock;
+}
+
+static void
+scst_cm_update_dev_start(struct scst_device *dev)
+{
+	int update_req_cnt, rc;
+
+	update_req_cnt = atomic_inc_return(&dev->cm_update_req_cnt);
+	if (update_req_cnt > 1)
+		return;
+
+	rc = __scst_cm_update_dev(dev);
+	if (rc)
+		atomic_set(&dev->cm_update_req_cnt, 0);
+}
+
+static void
+scst_cm_update_dev_fini(struct scst_device *dev)
+{
+	int update_req_cnt, rc;
+
+	update_req_cnt = atomic_dec_return(&dev->cm_update_req_cnt);
+
+	WARN_ON_ONCE(update_req_cnt < 0);
+
+	if (update_req_cnt == 0)
+		return;
+
+	/*
+	 * If we have received at least one update, we must re-update the
+	 * designators information. We don't care about the exact number of
+	 * updates we've received since the inquiry was submitted, as only the
+	 * last one is indicative. So set dev->cm_update_req_cnt to 1 to avoid
+	 * unnecessary __scst_cm_update_dev() calls.
+	 */
+	atomic_set(&dev->cm_update_req_cnt, 1);
+
+	rc = __scst_cm_update_dev(dev);
+	if (rc)
+		atomic_set(&dev->cm_update_req_cnt, 0);
+}
+
+void scst_cm_update_dev(struct scst_device *dev)
+{
+	TRACE_ENTRY();
+
+	if (!scst_auto_cm_assignment ||
+	    !dev->handler->auto_cm_assignment_possible)
+		goto out;
+
+	scst_cm_update_dev_start(dev);
+
+out:
+	TRACE_EXIT();
+
+	return;
 }
 
 int scst_cm_on_dev_register(struct scst_device *dev)
@@ -2710,7 +2789,7 @@ void scst_cm_on_dev_unregister(struct scst_device *dev)
 
 	lockdep_assert_held(&scst_mutex);
 
-	scst_cm_dev_unregister(dev, true);
+	scst_cm_dev_unregister(dev);
 
 	TRACE_EXIT();
 	return;
@@ -2790,7 +2869,7 @@ bool scst_cm_on_del_lun(struct scst_acg_dev *acg_dev, bool gen_report_luns_chang
 	if (acg_dev->acg != scst_cm_tgt->default_acg)
 		goto out;
 
-	scst_cm_dev_unregister(acg_dev->dev, false);
+	scst_cm_dev_free_designators(acg_dev->dev);
 
 	res = false;
 
