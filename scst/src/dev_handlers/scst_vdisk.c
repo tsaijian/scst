@@ -75,7 +75,7 @@
 #define SCST_FIO_VENDOR			"SCST_FIO"
 #define SCST_BIO_VENDOR			"SCST_BIO"
 /* 4 byte ASCII Product Revision Level - left aligned */
-#define SCST_FIO_REV			"370 "
+#define SCST_FIO_REV			"380 "
 
 #define MAX_USN_LEN			(20+1) /* For '\0' */
 #define MAX_INQ_VEND_SPECIFIC_LEN	(INQ_BUF_SZ - 96)
@@ -544,10 +544,10 @@ static void vdisk_check_tp_support(struct scst_vdisk_dev *virt_dev)
 	if (virt_dev->blockio) {
 		bdev = blkdev_get_by_path(virt_dev->filename, FMODE_READ,
 					  (void *)__func__);
-		res = IS_ERR(bdev) ? PTR_ERR(bdev) : 0;
+		res = PTR_ERR_OR_ZERO(bdev);
 	} else {
 		fd = filp_open(virt_dev->filename, O_LARGEFILE, 0600);
-		res = IS_ERR(fd) ? PTR_ERR(fd) : 0;
+		res = PTR_ERR_OR_ZERO(fd);
 	}
 	if (res) {
 		if (res == -EMEDIUMTYPE && virt_dev->blockio)
@@ -563,12 +563,14 @@ static void vdisk_check_tp_support(struct scst_vdisk_dev *virt_dev)
 	fd_open = true;
 
 	if (virt_dev->blockio) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 0)
-		virt_dev->dev_thin_provisioned =
-			!!bdev_max_discard_sectors(bdev);
-#else
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 19, 0) &&		\
+	(!defined(RHEL_RELEASE_CODE) ||				\
+	 RHEL_RELEASE_CODE -0 < RHEL_RELEASE_VERSION(9, 1))
 		virt_dev->dev_thin_provisioned =
 			blk_queue_discard(bdev_get_queue(bdev));
+#else
+		virt_dev->dev_thin_provisioned =
+			!!bdev_max_discard_sectors(bdev);
 #endif
 	} else {
 		virt_dev->dev_thin_provisioned = (fd->f_op->fallocate != NULL);
@@ -1310,11 +1312,11 @@ static int vdisk_open_fd(struct scst_vdisk_dev *virt_dev, bool read_only)
 			virt_dev->bdev_mode |= FMODE_WRITE;
 		virt_dev->bdev = blkdev_get_by_path(virt_dev->filename,
 					virt_dev->bdev_mode, (void *)__func__);
-		res = IS_ERR(virt_dev->bdev) ? PTR_ERR(virt_dev->bdev) : 0;
+		res = PTR_ERR_OR_ZERO(virt_dev->bdev);
 	} else {
 		virt_dev->fd = vdev_open_fd(virt_dev, virt_dev->filename,
 					    read_only);
-		res = IS_ERR(virt_dev->fd) ? PTR_ERR(virt_dev->fd) : 0;
+		res = PTR_ERR_OR_ZERO(virt_dev->fd);
 	}
 	if (res) {
 		virt_dev->bdev = NULL;
