@@ -76,7 +76,17 @@ static void scst_free_acn(struct scst_acn *acn, bool reassign);
 struct scsi_io_context {
 	void *data;
 	void (*done)(void *data, char *sense, int result, int resid);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 11, 0)
+	/*
+	 * See commit 772c8f6f3bbd ("Merge tag 'for-4.11/linus-merge-signed'
+	 * of git://git.kernel.dk/linux-block")
+	 *
+	 * Both scsi_init_rq and scsi_init_request (later renamed to
+	 * scsi_mq_init_request in e7008ff5c61a) initialize the scsi_request
+	 * sense buffer, so we don't need to (nor should) provide our own.
+	 */
 	char sense[SCST_SENSE_BUFFERSIZE];
+#endif
 };
 static struct kmem_cache *scsi_io_context_cache;
 static struct workqueue_struct *scst_release_acg_wq;
@@ -7928,6 +7938,8 @@ static void blk_free_kern_sg_work(struct blk_kern_sg_work *bw)
 	return;
 }
 
+static inline void scst_free_bio(struct bio *bio);
+
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 3, 0)
 static void blk_bio_map_kern_endio(struct bio *bio, int err)
 {
@@ -7958,7 +7970,7 @@ static void blk_bio_map_kern_endio(struct bio *bio)
 		}
 	}
 
-	bio_put(bio);
+	scst_free_bio(bio);
 	return;
 }
 
@@ -8120,6 +8132,57 @@ scst_free_passthrough_request(struct request *rq)
 #endif
 }
 
+/**
+ * scst_alloc_bio - Allocate a bio.
+ * @nr_vecs: Number of bio_vecs to allocate.
+ * @gfp_mask: The GFP_* mask given to the slab allocator.
+ *
+ * Returns
+ * Pointer to new bio on success, NULL on failure.
+ */
+static inline struct bio *
+scst_alloc_bio(unsigned short nr_vecs, gfp_t gfp_mask)
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 19, 0) &&		\
+	(!defined(RHEL_RELEASE_CODE) ||				\
+	 RHEL_RELEASE_CODE -0 < RHEL_RELEASE_VERSION(9, 1))
+	return bio_kmalloc(gfp_mask, nr_vecs);
+#else
+	/*
+	 * See also commit 066ff571011d ("block: turn bio_kmalloc into a
+	 * simple kmalloc wrapper").
+	 */
+	struct bio *bio;
+
+	bio = bio_kmalloc(nr_vecs, gfp_mask);
+	if (bio)
+		bio_init(bio, NULL, bio->bi_inline_vecs, nr_vecs, 0);
+
+	return bio;
+#endif
+}
+
+/**
+ * scst_free_bio - Free a bio that was allocated with scst_alloc_bio().
+ * @bio: bio pointer.
+ */
+static inline void
+scst_free_bio(struct bio *bio)
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 19, 0) &&		\
+	(!defined(RHEL_RELEASE_CODE) ||				\
+	 RHEL_RELEASE_CODE -0 < RHEL_RELEASE_VERSION(9, 1))
+	bio_put(bio);
+#else
+	/*
+	 * See also commit 066ff571011d ("block: turn bio_kmalloc into a
+	 * simple kmalloc wrapper").
+	 */
+	bio_uninit(bio);
+	kfree(bio);
+#endif
+}
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 8, 0) ||			\
 (defined(CONFIG_SUSE_KERNEL) && LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0))
 static struct request *blk_make_request(struct request_queue *q,
@@ -8232,7 +8295,7 @@ static struct request *__blk_map_kern_sg(struct request_queue *q,
 			int rc;
 
 			if (need_new_bio) {
-				bio = bio_kmalloc(gfp_mask, max_nr_vecs);
+				bio = scst_alloc_bio(max_nr_vecs, gfp_mask);
 				if (bio == NULL) {
 					rq = ERR_PTR(-ENOMEM);
 					goto out_free_bios;
@@ -8315,7 +8378,7 @@ out_free_bios:
 	while (hbio != NULL) {
 		bio = hbio;
 		hbio = hbio->bi_next;
-		bio_put(bio);
+		scst_free_bio(bio);
 	}
 	goto out;
 }
@@ -8497,14 +8560,16 @@ out:
 static void scsi_end_async(struct request *req, int error)
 #else
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 /*
  * See also commit de671d6116b5 ("block: change request end_io handler to pass
  * back a return value") # v6.1.
  */
-#define RQ_END_IO_RET enum rq_end_io_ret
-#else
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0) &&		\
+	(!defined(RHEL_RELEASE_CODE) ||				\
+	 RHEL_RELEASE_CODE -0 < RHEL_RELEASE_VERSION(9, 2))
 #define RQ_END_IO_RET void
+#else
+#define RQ_END_IO_RET enum rq_end_io_ret
 #endif
 
 static RQ_END_IO_RET scsi_end_async(struct request *req, blk_status_t error)
@@ -8530,6 +8595,7 @@ static RQ_END_IO_RET scsi_end_async(struct request *req, blk_status_t error)
 	if (sioc->done) {
 		int resid_len;
 		long result;
+		char *sense;
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0)
 		result = scsi_req(req)->result;
@@ -8544,16 +8610,20 @@ static RQ_END_IO_RET scsi_end_async(struct request *req, blk_status_t error)
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
 		resid_len = scsi_req(req)->resid_len;
+		sense = SREQ_SENSE(scsi_req(req));
 #else
 		resid_len = req->resid_len;
+		sense = sioc->sense;
 #endif
 
-		sioc->done(sioc->data, sioc->sense, result, resid_len);
+		sioc->done(sioc->data, sense, result, resid_len);
 	}
 
 	kmem_cache_free(scsi_io_context_cache, sioc);
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0) &&		\
+	(!defined(RHEL_RELEASE_CODE) ||				\
+	 RHEL_RELEASE_CODE -0 < RHEL_RELEASE_VERSION(9, 2))
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 21, 0) &&	\
 	(!defined(RHEL_MAJOR) || RHEL_MAJOR -0 < 8)
 	/* See also commit 92bc5a24844a ("block: remove __blk_put_request()") */
@@ -8655,8 +8725,19 @@ int scst_scsi_exec_async(struct scst_cmd *cmd, void *data,
 	memset(SREQ_CP(req), 0, MAX_COMMAND_SIZE); /* ATAPI hates garbage after CDB */
 	memcpy(SREQ_CP(req), cmd->cdb, cmd->cdb_len);
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 11, 0)
+	/*
+	 * See commit 772c8f6f3bbd ("Merge tag 'for-4.11/linus-merge-signed'
+	 * of git://git.kernel.dk/linux-block")
+	 *
+	 * Both scsi_init_rq and scsi_init_request (later renamed to
+	 * scsi_mq_init_request in e7008ff5c61a) initialize the scsi_request
+	 * sense buffer, so we don't need to (nor should) provide our own.
+	 */
 	SREQ_SENSE(req) = sioc->sense;
 	req->sense_len = sizeof(sioc->sense);
+#endif
+
 	rq->timeout = cmd->timeout;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0)
 	req->retries = cmd->retries;
