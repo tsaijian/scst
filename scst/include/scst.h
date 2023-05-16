@@ -481,6 +481,9 @@ enum scst_exec_res {
 /* Cache of tgt->tgt_forward_dst */
 #define SCST_TGT_DEV_FORWARD_DST	5
 
+/* Cache of tgt->tgt_aen_disabled */
+#define SCST_TGT_DEV_AEN_DISABLED	6
+
 /*************************************************************
  ** I/O grouping types. Changing them don't forget to change
  ** the corresponding *_STR values in scst_const.h!
@@ -1694,6 +1697,12 @@ struct scst_tgt {
 	 */
 	unsigned tgt_forward_dst:1;
 
+	/*
+	 * Set if do not to wish to send AEN from this target port, even if
+	 * supported by the transport.  Send a UA instead.
+	 */
+	unsigned int tgt_aen_disabled:1;
+
 	/* Per target analog of the corresponding driver's fields */
 	unsigned tgt_dif_supported:1;
 	unsigned tgt_hw_dif_type1_supported:1;
@@ -2628,6 +2637,26 @@ struct scst_dev_registrant {
 	int dlm_idx;
 	struct scst_lksb lksb;
 	char lvb[PR_DLM_LVB_LEN];
+	uint32_t registered_by_nodeid;
+
+	/* List of UNIT ATTENTIONs to be sent by this node to this registrant on a remote node */
+	struct list_head pending_rem_ua_list;
+
+	/*
+	 * List of UNIT ATTENTIONs already sent by this node to this registrant on a remote node
+	 *
+	 * Once the remote node clears next_rem_ua_idx, we can discard the entries.
+	 */
+	struct list_head sent_rem_ua_list;
+
+	/*
+	 * Index to indicate the tail of a 'queue' of incoming UNIT ATTENTIONs from remote nodes
+	 * to this node, implemented as PR_REG_UA_LOCK locks.
+	 *
+	 * It will be incremented by the sender of each UA, and cleared by the recipiant node when
+	 * it reads all the UNIT ATTENTIONs directed to it.
+	 */
+	uint16_t next_rem_ua_idx;
 };
 
 /**
@@ -2648,6 +2677,7 @@ struct scst_dev_registrant {
  *                   reservation on @dev.
  * @reserve:         Apply an SPC-2 reservation for session @sess on @dev if
  *                   @sess != NULL or clear that reservation if @ses == NULL.
+ * @pr_reg_queue_rem_ua  Queue a UNIT ATTENTION to a remote registrant.
  */
 struct scst_cl_ops {
 	int  (*pr_init)(struct scst_device *dev, const char *cl_dev_id);
@@ -2670,6 +2700,9 @@ struct scst_cl_ops {
 	bool (*is_not_rsv_holder)(struct scst_device *dev,
 				  struct scst_session *sess);
 	void (*reserve)(struct scst_device *dev, struct scst_session *sess);
+	void (*pr_reg_queue_rem_ua)(struct scst_device *dev,
+				    struct scst_dev_registrant *reg,
+				    int key, int asc, int ascq);
 };
 
 /*
@@ -5551,33 +5584,63 @@ ssize_t scst_readv(struct file *file, const struct kvec *vec,
 ssize_t scst_writev(struct file *file, const struct kvec *vec,
 		    unsigned long vlen, loff_t *pos);
 void scst_write_same(struct scst_cmd *cmd, struct scst_data_descriptor *where);
+
 /**
- * scsi_execute - insert a SCSI request and wait for the result
- * @sdev:	scsi device
+ * __scst_scsi_execute_cmd - insert request and wait for the result
+ * @sdev:	scsi_device
  * @cmd:	scsi command
- * @data_direction: data direction
+ * @data_direction: data direction - DMA_TO_DEVICE or DMA_FROM_DEVICE
  * @buffer:	data buffer
- * @bufflen:	length of buffer - DMA_TO_DEVICE, DMA_FROM_DEVICE or DMA_NONE
- * @sense:	optional sense buffer
- * @timeout:	request timeout in seconds
+ * @bufflen:	len of buffer
+ * @sensebuf:	sense buffer
+ * @sense_len:	len of sense buffer
+ * @timeout:	request timeout in HZ
  * @retries:	number of times to retry request
- * @flags:	flags for ->cmd_flags, e.g. REQ_FAILFAST_DEV
+ * @opf:	block layer request cmd_flags
  *
  * Returns the scsi_cmnd result field if a command was executed, or a negative
  * Linux error code if we didn't get that far.
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
-#define scst_scsi_execute(sdev, cmd, data_direction, buffer, bufflen, sense, \
-			  timeout, retries, flags)			\
-	scsi_execute(sdev, cmd, data_direction, buffer, bufflen, sense,	\
-		     NULL /* sshdr */, timeout, retries, flags,		\
-		     0 /* rq_flags */, NULL /* resid */)
+static inline int
+__scst_scsi_execute_cmd(struct scsi_device *sdev, const unsigned char *cmd,
+			int data_direction, void *buffer, unsigned int bufflen,
+			unsigned char *sense, unsigned int sense_len,
+			int timeout, int retries, blk_opf_t opf)
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 3, 0)
+	if (WARN_ON_ONCE(sense && sense_len != SCSI_SENSE_BUFFERSIZE))
+		return -EINVAL;
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 11, 0)
+	return scsi_execute(sdev, cmd, data_direction, buffer, bufflen, sense,
+			    timeout, retries, opf, /*resid=*/NULL);
+
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0) &&	\
+	(!defined(RHEL_MAJOR) || RHEL_MAJOR -0 < 8)
+	return scsi_execute(sdev, cmd, data_direction, buffer, bufflen, sense,
+			    /*sshdr=*/NULL, timeout, retries, opf,
+			    /*rq_flags=*/0, /*resid=*/NULL);
 #else
-#define scst_scsi_execute(sdev, cmd, data_direction, buffer, bufflen, sense, \
-			  timeout, retries, flags)			\
-	scsi_execute(sdev, cmd, data_direction, buffer, bufflen, sense,	\
-		     timeout, retries, flags, NULL /* resid */)
+	return __scsi_execute(sdev, cmd, data_direction, buffer, bufflen, sense,
+			      /*sshdr=*/NULL, timeout, retries, opf,
+			      /*rq_flags=*/0, /*resid=*/NULL);
 #endif
+
+#else
+	opf |= data_direction == DMA_TO_DEVICE ? REQ_OP_DRV_OUT : REQ_OP_DRV_IN;
+
+	return scsi_execute_cmd(sdev, cmd, opf, buffer, bufflen, timeout,
+				retries, &(struct scsi_exec_args) {
+					.sense = sense,
+					.sense_len = sense_len,
+				});
+#endif
+}
+
+#define scst_scsi_execute_cmd(sdev, cmd, data_direction, buffer, bufflen, sense,	\
+			      timeout, retries, opf)					\
+	__scst_scsi_execute_cmd(sdev, cmd, data_direction, buffer, bufflen, sense,	\
+				sizeof(sense), timeout, retries, opf)
 
 __be64 scst_pack_lun(const uint64_t lun, enum scst_lun_addr_method addr_method);
 uint64_t scst_unpack_lun(const uint8_t *lun, int len);

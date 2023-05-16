@@ -537,7 +537,7 @@ static void sqa_qla2xxx_handle_data(struct qla_tgt_cmd *cmd)
 		case DIF_ERR_NONE:
 		default:
 			scst_set_cmd_error(scst_cmd,
-				SCST_LOAD_SENSE(scst_sense_write_error));
+				SCST_LOAD_SENSE(scst_sense_aborted_command));
 			break;
 		}
 	}
@@ -614,7 +614,7 @@ static int sqa_qla2xxx_handle_tmr(struct qla_tgt_mgmt_cmd *mcmd, u64 lun,
 		TRACE(TRACE_MGMT, "sqatgt(%ld/%d) ABORT_TS received.",
 			sess->tgt->vha->host_no, sess->tgt->vha->vp_idx);
 		rc = scst_rx_mgmt_fn_lun(scst_sess, SCST_ABORT_TASK_SET,
-					 &lun, lun_size, SCST_ATOMIC, mcmd);
+					 &sl, lun_size, SCST_ATOMIC, mcmd);
 		break;
 
 	case QLA_TGT_ABORT_ALL: // TMR_TARGET_COLD_RESET:

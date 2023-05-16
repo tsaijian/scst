@@ -42,6 +42,8 @@ else
      KDIR=/lib/modules/$(KVER)/build
 endif
 
+PKG_BUILD_MODE ?= 2release
+
 OLD_QLA_INI_DIR=qla2x00t
 OLD_QLA_DIR=$(OLD_QLA_INI_DIR)/qla2x00-target
 
@@ -68,14 +70,17 @@ EMULEX_DIR=emulex
 
 ISCSI_DIR=iscsi-scst
 
-REVISION ?= $(shell if [ -e .svn ]; then				\
-		      svn info | sed -n 's/^Revision:[[:blank:]]*/./p';	\
-		    elif [ -e .git ]; then				\
-                      echo -n .;					\
-		      git log | grep -c ^commit;			\
-		    fi)
+SCST_GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null)
+
+REVISION ?= $(SCST_GIT_COMMIT)
+export REVISION
+
 VERSION_WITHOUT_REVISION := $(shell echo -n "$$(sed -n 's/^\#define[[:blank:]]SCST_VERSION_NAME[[:blank:]]*\"\([^-]*\).*\"/\1/p' scst/include/scst_const.h)")
-VERSION := $(VERSION_WITHOUT_REVISION)$(REVISION)
+ifneq (, $(REVISION))
+VERSION := $(VERSION_WITHOUT_REVISION).$(REVISION)
+else
+VERSION := $(VERSION_WITHOUT_REVISION)
+endif
 DEBIAN_REVISION=1.1
 RPMTOPDIR ?= $(shell if [ $$(id -u) = 0 ]; then echo /usr/src/packages;\
 		else echo $$PWD/rpmbuilddir; fi)
@@ -353,8 +358,9 @@ scst-rpm:
 	MAKE="$(MAKE)" rpmbuild --define="%_topdir $${rpmtopdir}"	\
 	    $(if $(KVER),--define="%kversion $(KVER)")			\
 	    $(if $(KDIR),--define="%kdir $(KDIR)")			\
+	    --define="%pkg_build_mode $(PKG_BUILD_MODE)"		\
 	    -ba $${name}.spec &&					\
-	rm -f $${name}-$(VERSION).tar.bz2
+	rm -f scst-$(VERSION).tar.bz2
 
 scst-dkms-rpm:
 	name=scst-dkms &&						\
@@ -369,8 +375,9 @@ scst-dkms-rpm:
 	MAKE="$(MAKE)" rpmbuild --define="%_topdir $${rpmtopdir}"	\
 	    $(if $(KVER),--define="%kversion $(KVER)")			\
 	    $(if $(KDIR),--define="%kdir $(KDIR)")			\
+	    --define="%pkg_build_mode $(PKG_BUILD_MODE)"		\
 	    -ba $${name}.spec &&					\
-	rm -f $${name}-$(VERSION).tar.bz2
+	rm -f scst-$(VERSION).tar.bz2
 
 rpm:
 	$(MAKE) scst-rpm
@@ -440,7 +447,8 @@ dpkg: ../scst_$(VERSION).orig.tar.gz
 	  buildopts+=(-j4);						\
 	fi &&								\
 	DEB_CC_SET="$(CC)" DEB_KVER_SET=$(KVER) DEB_KDIR_SET=$(KDIR) DEB_QLA_DIR_SET=$(QLA_DIR) \
-	   DEB_QLA_INI_DIR_SET=$(QLA_INI_DIR) debuild "$${buildopts[@]}" --lintian-opts --profile debian && \
+	   DEB_QLA_INI_DIR_SET=$(QLA_INI_DIR) DEB_PKG_BUILD_MODE=$(PKG_BUILD_MODE) \
+	   debuild "$${buildopts[@]}" --lintian-opts --profile debian && \
 	mkdir -p dpkg &&						\
 	for f in "$${output_files[@]}" ../scst_$(VERSION).orig.tar.[gx]z; do\
 		mv $$f dpkg || true;					\

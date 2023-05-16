@@ -907,7 +907,7 @@ static int scst_local_queuecommand(struct Scsi_Host *host,
 	sgl_count = scsi_sg_count(scmd);
 
 	if (scsi_bidi_cmnd(scmd)) {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 1, 0) && 		\
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 1, 0) &&		\
 	(!defined(RHEL_RELEASE_CODE) ||				\
 	 RHEL_RELEASE_CODE -0 < RHEL_RELEASE_VERSION(8, 3))
 		/* Some of these symbols are only defined after 2.6.24 */
@@ -1375,7 +1375,7 @@ static struct scst_tgt_template scst_local_targ_tmpl = {
 #endif
 };
 
-static struct scsi_host_template scst_lcl_ini_driver_template = {
+static const struct scsi_host_template scst_lcl_ini_driver_template = {
 	.name				= SCST_LOCAL_NAME,
 	.queuecommand			= scst_local_queuecommand,
 	.change_queue_depth		= scst_local_change_queue_depth,
@@ -1425,7 +1425,8 @@ static int scst_local_driver_probe(struct device *dev)
 
 	TRACE_DBG("sess %p", sess);
 
-	hpnt = scsi_host_alloc(&scst_lcl_ini_driver_template, sizeof(*sess));
+	hpnt = scsi_host_alloc((struct scsi_host_template *) &scst_lcl_ini_driver_template,
+				sizeof(*sess));
 	if (hpnt == NULL) {
 		PRINT_ERROR("%s", "scsi_register() failed");
 		ret = -ENODEV;
@@ -1462,8 +1463,12 @@ out:
 	return ret;
 }
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
-/* See also commit fc7a6209d571 ("bus: Make remove callback return void") */
+/*
+ * See also commit fc7a6209d571 ("bus: Make remove callback return void")
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0) &&		\
+	(!defined(RHEL_RELEASE_CODE) ||				\
+	 RHEL_RELEASE_CODE -0 < RHEL_RELEASE_VERSION(9, 2))
 #define DRIVER_REMOVE_RET int
 #else
 #define DRIVER_REMOVE_RET void

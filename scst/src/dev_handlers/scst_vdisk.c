@@ -112,6 +112,7 @@
 #define DEF_EXPL_ALUA			0
 #define DEF_DEV_ACTIVE			1
 #define DEF_BIND_ALUA_STATE		1
+#define DEF_LB_PER_PB_EXP		1
 
 #define VDISK_NULLIO_SIZE		(5LL*1024*1024*1024*1024/2)
 
@@ -185,6 +186,7 @@ struct scst_vdisk_dev {
 	unsigned int reexam_pending:1;
 	unsigned int size_key:1;
 	unsigned int opt_trans_len_set:1;
+	unsigned int lb_per_pb_exp:1;
 
 	struct file *fd;
 	struct file *dif_fd;
@@ -450,7 +452,7 @@ static int vdisk_blockio_flush(struct block_device *bdev, gfp_t gfp_mask,
 		 * 28a8f0d317bf ("block, drivers, fs: rename REQ_FLUSH to
 		 * REQ_PREFLUSH") # v4.8.
 		 */
-		bio_set_op_attrs(bio, REQ_OP_WRITE, REQ_PREFLUSH);
+		bio->bi_opf = REQ_OP_WRITE | REQ_PREFLUSH;
 		submit_bio(bio);
 #else
 		/*
@@ -2889,7 +2891,7 @@ static ssize_t blockio_read_sync(struct scst_vdisk_dev *virt_dev, void *buf,
 	LINUX_VERSION_CODE < KERNEL_VERSION(4, 4, 0)
 	bio->bi_rw = READ_SYNC;
 #else
-	bio_set_op_attrs(bio, REQ_OP_READ, REQ_SYNC);
+	bio->bi_opf = REQ_OP_READ | REQ_SYNC;
 #endif
 	bio_set_dev(bio, bdev);
 	bio->bi_end_io = blockio_end_sync_io;
@@ -3157,7 +3159,9 @@ struct bio_vec *vdisk_map_pages_to_bvec(struct bio_vec *bvec, struct page *page,
 }
 
 static void fileio_async_complete(struct kiocb *iocb, long ret
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0) &&		\
+	(!defined(RHEL_RELEASE_CODE) ||				\
+	 RHEL_RELEASE_CODE -0 < RHEL_RELEASE_VERSION(9, 2))
 				  , long ret2
 #endif
 				  )
@@ -3236,8 +3240,8 @@ static enum compl_status_e fileio_exec_async(struct vdisk_cmd_params *p)
 
 	WARN_ON_ONCE(sg_cnt != cmd->sg_cnt);
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0) || 	\
-		(defined(RHEL_RELEASE_CODE) && 		\
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0) ||	\
+		(defined(RHEL_RELEASE_CODE) &&		\
 		 RHEL_RELEASE_CODE -0 >= RHEL_RELEASE_VERSION(8, 2))
 	iov_iter_bvec(&iter, dir, p->async.bvec, sg_cnt, total);
 #else
@@ -3267,7 +3271,9 @@ static enum compl_status_e fileio_exec_async(struct vdisk_cmd_params *p)
 	if (p->async.bvec != p->async.small_bvec)
 		kfree(p->async.bvec);
 	if (ret != -EIOCBQUEUED) {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0) &&		\
+	(!defined(RHEL_RELEASE_CODE) ||				\
+	 RHEL_RELEASE_CODE -0 < RHEL_RELEASE_VERSION(9, 2))
 		fileio_async_complete(iocb, ret, 0);
 #else
 		fileio_async_complete(iocb, ret);
@@ -4943,7 +4949,7 @@ static enum compl_status_e vdisk_exec_read_capacity16(struct vdisk_cmd_params *p
 	struct scst_vdisk_dev *virt_dev;
 	struct block_device *bdev;
 	struct request_queue *q;
-	uint32_t blocksize, physical_blocksize;
+	uint32_t blocksize;
 	uint64_t nblocks;
 	uint8_t buffer[32];
 
@@ -4988,8 +4994,10 @@ static enum compl_status_e vdisk_exec_read_capacity16(struct vdisk_cmd_params *p
 	}
 
 	/* LOGICAL BLOCKS PER PHYSICAL BLOCK EXPONENT */
-	physical_blocksize = q ? queue_physical_block_size(q) : 4096;
-	buffer[13] = max(ilog2(physical_blocksize) - ilog2(blocksize), 0);
+	if (virt_dev->lb_per_pb_exp) {
+		uint32_t physical_blocksize = q ? queue_physical_block_size(q) : 4096;
+		buffer[13] = max(ilog2(physical_blocksize) - ilog2(blocksize), 0);
+	}
 
 	if (virt_dev->thin_provisioned) {
 		buffer[14] |= 0x80;     /* LBPME */
@@ -6027,7 +6035,7 @@ static void blockio_exec_rw(struct vdisk_cmd_params *p, bool write, bool fua)
 	LINUX_VERSION_CODE < KERNEL_VERSION(4, 4, 0)
 					bio->bi_rw |= REQ_WRITE;
 #else
-					bio_set_op_attrs(bio, REQ_OP_WRITE, 0);
+					bio->bi_opf = REQ_OP_WRITE;
 #endif
 				/*
 				 * Better to fail fast w/o any local recovery
@@ -6740,6 +6748,7 @@ static int vdev_create_node(struct scst_dev_type *devt,
 	virt_dev->numa_node_id = NUMA_NO_NODE;
 	virt_dev->dev_active = DEF_DEV_ACTIVE;
 	virt_dev->bind_alua_state = DEF_BIND_ALUA_STATE;
+	virt_dev->lb_per_pb_exp = DEF_LB_PER_PB_EXP;
 
 	if (strlen(name) >= sizeof(virt_dev->name)) {
 		PRINT_ERROR("Name %s is too long (max allowed %zd)", name,
@@ -6845,6 +6854,35 @@ static void vdev_check_node(struct scst_vdisk_dev **pvirt_dev, int orig_nodeid)
 out:
 	TRACE_EXIT();
 	return;
+}
+
+static int vdev_set_t10_dev_id(struct scst_vdisk_dev *virt_dev,
+			       const char *buf, size_t count)
+{
+	size_t t10_dev_id_size, i;
+
+	t10_dev_id_size = sizeof(virt_dev->t10_dev_id);
+
+	if (count > t10_dev_id_size ||
+			(count == t10_dev_id_size && buf[count - 1] != '\n')) {
+		PRINT_ERROR("T10 device id is too long (max %zu characters)",
+			    t10_dev_id_size - 1);
+		return -EINVAL;
+	}
+
+	memset(virt_dev->t10_dev_id, 0, t10_dev_id_size);
+	memcpy(virt_dev->t10_dev_id, buf, count);
+
+	for (i = 0; i < t10_dev_id_size; i++) {
+		if (virt_dev->t10_dev_id[i] == '\n') {
+			virt_dev->t10_dev_id[i] = '\0';
+			break;
+		}
+	}
+
+	virt_dev->t10_dev_id_set = 1;
+
+	return 0;
 }
 
 /*
@@ -6988,6 +7026,16 @@ static int vdev_parse_add_dev_params(struct scst_vdisk_dev *virt_dev,
 			continue;
 		}
 
+		if (!strcasecmp("t10_dev_id", p)) {
+			res = vdev_set_t10_dev_id(virt_dev, pp, strlen(pp));
+			if (unlikely(res)) {
+				PRINT_ERROR("Failed to set %s t10_dev_id", pp);
+				goto out;
+			}
+
+			continue;
+		}
+
 		res = kstrtoll(pp, 0, &ll_val);
 		if (res != 0) {
 			PRINT_ERROR("strtoll() for %s failed: %d (device %s)",
@@ -7085,6 +7133,10 @@ static int vdev_parse_add_dev_params(struct scst_vdisk_dev *virt_dev,
 			virt_dev->dif_static_app_tag_combined = cpu_to_be64(ull_val);
 			TRACE_DBG("DIF static app tag %llx",
 				(long long)be64_to_cpu(virt_dev->dif_static_app_tag_combined));
+		} else if (!strcasecmp("lb_per_pb_exp", p)) {
+			virt_dev->lb_per_pb_exp = ull_val;
+			TRACE_DBG("LB_PER_PB_EXP %d",
+				  virt_dev->lb_per_pb_exp);
 		} else {
 			PRINT_ERROR("Unknown parameter %s (device %s)", p,
 				virt_dev->name);
@@ -8839,9 +8891,9 @@ static ssize_t vdev_sysfs_scsi_device_name_show(struct kobject *kobj,
 static ssize_t vdev_sysfs_t10_dev_id_store(struct kobject *kobj,
 	struct kobj_attribute *attr, const char *buf, size_t count)
 {
-	int res, i;
 	struct scst_device *dev;
 	struct scst_vdisk_dev *virt_dev;
+	int res;
 
 	TRACE_ENTRY();
 
@@ -8854,28 +8906,9 @@ static ssize_t vdev_sysfs_t10_dev_id_store(struct kobject *kobj,
 
 	write_lock(&vdisk_serial_rwlock);
 
-	if ((count > sizeof(virt_dev->t10_dev_id)) ||
-	    ((count == sizeof(virt_dev->t10_dev_id)) &&
-	     (buf[count-1] != '\n'))) {
-		PRINT_ERROR("T10 device id is too long (max %zd "
-			"characters)", sizeof(virt_dev->t10_dev_id)-1);
-		res = -EINVAL;
+	res = vdev_set_t10_dev_id(virt_dev, buf, count);
+	if (unlikely(res))
 		goto out_unlock;
-	}
-
-	memset(virt_dev->t10_dev_id, 0, sizeof(virt_dev->t10_dev_id));
-	memcpy(virt_dev->t10_dev_id, buf, count);
-
-	i = 0;
-	while (i < sizeof(virt_dev->t10_dev_id)) {
-		if (virt_dev->t10_dev_id[i] == '\n') {
-			virt_dev->t10_dev_id[i] = '\0';
-			break;
-		}
-		i++;
-	}
-
-	virt_dev->t10_dev_id_set = 1;
 
 	schedule_work(&virt_dev->vdev_inq_changed_work);
 
@@ -9403,6 +9436,40 @@ static ssize_t vdev_dif_filename_show(struct kobject *kobj,
 	return pos;
 }
 
+static ssize_t vdev_lb_per_pb_exp_store(struct kobject *kobj,
+	struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	struct scst_device *dev =
+		container_of(kobj, struct scst_device, dev_kobj);
+	struct scst_vdisk_dev *virt_dev = dev->dh_priv;
+	long val;
+	int res;
+
+	res = kstrtol(buf, 0, &val);
+	if (res)
+		return res;
+	if (val != !!val)
+		return -EINVAL;
+
+	spin_lock(&virt_dev->flags_lock);
+	virt_dev->lb_per_pb_exp = val;
+	spin_unlock(&virt_dev->flags_lock);
+
+	return count;
+}
+
+static ssize_t vdev_lb_per_pb_exp_show(struct kobject *kobj,
+			       struct kobj_attribute *attr, char *buf)
+{
+	struct scst_device *dev =
+		container_of(kobj, struct scst_device, dev_kobj);
+	struct scst_vdisk_dev *virt_dev = dev->dh_priv;
+
+	return sprintf(buf, "%d\n%s", virt_dev->lb_per_pb_exp,
+		      (virt_dev->lb_per_pb_exp == DEF_LB_PER_PB_EXP)
+			? "" : SCST_SYSFS_KEY_MARK "\n");
+}
+
 
 static struct kobj_attribute vdev_active_attr =
 	__ATTR(active, S_IWUSR|S_IRUGO, vdev_sysfs_active_show,
@@ -9493,6 +9560,8 @@ static struct kobj_attribute vdev_inq_vend_specific_attr =
 	       vdev_sysfs_inq_vend_specific_store);
 static struct kobj_attribute vdev_async_attr =
 	__ATTR(async, S_IWUSR|S_IRUGO, vdev_async_show, vdev_async_store);
+static struct kobj_attribute vdev_lb_per_pb_exp_attr =
+	__ATTR(lb_per_pb_exp, S_IWUSR|S_IRUGO, vdev_lb_per_pb_exp_show, vdev_lb_per_pb_exp_store);
 
 static struct kobj_attribute vcdrom_filename_attr =
 	__ATTR(filename, S_IRUGO|S_IWUSR, vdev_sysfs_filename_show,
@@ -9538,6 +9607,7 @@ static const struct attribute *vdisk_fileio_attrs[] = {
 	&vdev_usn_attr.attr,
 	&vdev_inq_vend_specific_attr.attr,
 	&vdev_async_attr.attr,
+	&vdev_lb_per_pb_exp_attr.attr,
 	NULL,
 };
 
@@ -9558,6 +9628,7 @@ static const char *const fileio_add_dev_params[] = {
 	"rotational",
 	"thin_provisioned",
 	"tst",
+	"t10_dev_id",
 	"write_through",
 	NULL
 };
@@ -9628,6 +9699,7 @@ static const struct attribute *vdisk_blockio_attrs[] = {
 	&vdev_usn_attr.attr,
 	&vdev_inq_vend_specific_attr.attr,
 	&vdisk_tp_attr.attr,
+	&vdev_lb_per_pb_exp_attr.attr,
 	NULL,
 };
 
@@ -9648,6 +9720,7 @@ static const char *const blockio_add_dev_params[] = {
 	"rotational",
 	"thin_provisioned",
 	"tst",
+	"t10_dev_id",
 	"write_through",
 	NULL
 };
@@ -9721,6 +9794,7 @@ static const char *const nullio_add_dev_params[] = {
 	"size",
 	"size_mb",
 	"tst",
+	"t10_dev_id",
 	NULL
 };
 

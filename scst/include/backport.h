@@ -177,6 +177,13 @@ enum {
 };
 #endif
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0)
+/*
+ * See also commit 342a72a33407 ("block: Introduce the type blk_opf_t") # v6.0
+ */
+typedef unsigned int blk_opf_t;
+#endif
+
 /* <linux/blk-mq.h> */
 
 static inline unsigned int scst_blk_rq_cpu(struct request *rq)
@@ -576,8 +583,9 @@ static inline long get_user_pages_backport(unsigned long start,
 
 /* <linux/kobject_ns.h> */
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 16, 0) && 	\
-	(!defined(RHEL_MAJOR) || RHEL_MAJOR -0 < 7)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 16, 0) &&		\
+	(!defined(RHEL_RELEASE_CODE) ||				\
+	 RHEL_RELEASE_CODE -0 < RHEL_RELEASE_VERSION(7, 6))
 /*
  * See also commit 5f256becd868 ("[NET]: Basic network namespace
  * infrastructure."; v2.6.24). a685e08987d1 ("Delay struct net freeing while
@@ -1463,10 +1471,8 @@ static inline void scsi_build_sense(struct scsi_cmnd *scmd, int desc,
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0) &&		\
 	(!defined(RHEL_RELEASE_CODE) ||				\
-	 RHEL_RELEASE_CODE -0 < RHEL_RELEASE_VERSION(9, 1))
-
-#if (!defined(RHEL_RELEASE_CODE) || \
-	RHEL_RELEASE_CODE -0 != RHEL_RELEASE_VERSION(8, 7))
+	 RHEL_RELEASE_CODE -0 < RHEL_RELEASE_VERSION(8, 7) ||	\
+	 RHEL_RELEASE_CODE -0 == RHEL_RELEASE_VERSION(9, 0))
 /*
  * See also 51f3a4788928 ("scsi: core: Introduce the scsi_cmd_to_rq()
  * function").
@@ -1475,6 +1481,32 @@ static inline struct request *scsi_cmd_to_rq(struct scsi_cmnd *scmd)
 {
 	return scmd->request;
 }
+#endif
+
+/*
+ * See also commits 7ba46799d346 ("scsi: core: Add scsi_prot_ref_tag()
+ * helper") and ddd0bc756983 ("block: move ref_tag calculation func to the
+ * block layer"; v4.19).
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0) &&		\
+	(!defined(RHEL_RELEASE_CODE) ||				\
+	 RHEL_RELEASE_CODE -0 < RHEL_RELEASE_VERSION(9, 1))
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0) ||		\
+	(defined(RHEL_RELEASE_CODE) &&				\
+	 RHEL_RELEASE_CODE -0 < RHEL_RELEASE_VERSION(8, 7))
+static inline u32 scsi_prot_ref_tag(struct scsi_cmnd *scmd)
+{
+#if defined(RHEL_MAJOR) && RHEL_MAJOR -0 == 7
+	WARN_ON_ONCE(true);
+	return 0;
+#else
+	struct request *rq = blk_mq_rq_from_pdu(scmd);
+
+	return t10_pi_ref_tag(rq);
+#endif
+}
+#endif
 #endif
 
 /*
@@ -1488,28 +1520,6 @@ static inline unsigned int scsi_prot_interval(struct scsi_cmnd *scmd)
 	WARN_ON_ONCE(true);
 	return 512;
 }
-#endif
-
-/*
- * See also commits 7ba46799d346 ("scsi: core: Add scsi_prot_ref_tag()
- * helper") and ddd0bc756983 ("block: move ref_tag calculation func to the
- * block layer"; v4.19).
- */
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0) || \
-	(defined(RHEL_RELEASE_CODE) && \
-	 RHEL_RELEASE_CODE -0 != RHEL_RELEASE_VERSION(8, 7)))
-static inline u32 scsi_prot_ref_tag(struct scsi_cmnd *scmd)
-{
-#if defined(RHEL_MAJOR) && RHEL_MAJOR -0 == 7
-	WARN_ON_ONCE(true);
-	return 0;
-#else
-	struct request *rq = blk_mq_rq_from_pdu(scmd);
-
-	return t10_pi_ref_tag(rq);
-#endif
-}
-#endif
 #endif
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0) &&		\
@@ -1634,17 +1644,29 @@ enum {
 #define wwn_to_u64(wwn) get_unaligned_be64(wwn)
 #endif
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 3, 0)
 /*
- * See also commit c39e0af64bce ("scsi: scsi_transport_fc: Add FPIN fc event
- * codes") # v5.2
+ * See also commit 64fd2ba977b1 ("scsi: scsi_transport_fc: Add an additional
+ * flag to fc_host_fpin_rcv()") # v6.3
  */
+static inline void
+fc_host_fpin_rcv_backport(struct Scsi_Host *shost, u32 fpin_len, char *fpin_buf,
+			  u8 event_acknowledge)
+{
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 2, 0) && \
 	(!defined(RHEL_MAJOR) || RHEL_MAJOR -0 < 8 ||	\
 	 RHEL_MAJOR -0 == 8 && RHEL_MINOR -0 < 2)
-static inline void
-fc_host_fpin_rcv(struct Scsi_Host *shost, u32 fpin_len, char *fpin_buf)
-{
+	/*
+	 * See also commit c39e0af64bce ("scsi: scsi_transport_fc: Add FPIN fc event
+	 * codes") # v5.2
+	 */
+	return;
+#else
+	return fc_host_fpin_rcv(shost, fpin_len, fpin_buf);
+#endif
 }
+
+#define fc_host_fpin_rcv fc_host_fpin_rcv_backport
 #endif
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)

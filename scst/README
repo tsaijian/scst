@@ -825,6 +825,13 @@ Every target should have at least the following entries:
 
    For instance, read_unaligned_cmd_count means number of 4K unaligned IOs.
 
+ - aen_disabled - if set this target port is not to send AEN (Asynchronous
+   Event Notification), but rather generate a Unit Attention - even if the
+   underlying transport does support AEN.
+
+   This could prove useful in different situations including when the target
+   is also a forward_dst.
+
 A target driver may have also the following entries:
 
  - "hw_target" - if the target driver supports both hardware and virtual
@@ -1141,9 +1148,9 @@ cache. The following parameters possible for vdisk_fileio:
  - opt_trans_len - specifies the optimal transfer length data in the block
    limits VPD page. Value is in bytes, and must be a multiple of the block
    size. Default is 524288. Setting this parameter to a multiple of the
-   optimal transfer length below 4 MB may improve performance. Setting this
-   parameter to a value above 4 MB hurts performance because the SGV cache
-   only supports buffers up to 4 MB.
+   block size that is less than 4194304 (4 MB) may improve performance.
+   Setting this parameter to a value greater than 4194304 hurts performance
+   because the SGV cache only supports buffers up to 4 MB.
 
  - write_through - disables write back caching. Note, this option
    has sense only if you also *manually* disable write-back cache in
@@ -1241,6 +1248,12 @@ cache. The following parameters possible for vdisk_fileio:
 
  - dif_filename - specifies full path to filename, where DIF tags will
    be stored.
+
+ - lb_per_pb_exp - allows READ CAPACITY 16 to return LOGICAL BLOCKS
+   PER PHYSICAL BLOCK EXPONENT.  Possible values are: 0 - the exponent
+   is not returned (zero is returned instead) and 1 - the device value is
+   returned. Default - 1.  There are some initiators (like MS SQL) that
+   do not like large physical block sizes, even if they are true.
 
 Handler vdisk_blockio provides BLOCKIO mode to create virtual devices.
 This mode performs direct block I/O with a block device, bypassing the

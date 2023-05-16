@@ -3619,13 +3619,13 @@ qla2x00_mem_free(struct qla_hw_data *ha)
 	ha->gid_list_dma = 0;
 }
 
-struct scsi_qla_host *qla2x00_create_host(struct scsi_host_template *sht,
-						struct qla_hw_data *ha)
+struct scsi_qla_host *qla2x00_create_host(const struct scsi_host_template *sht,
+					  struct qla_hw_data *ha)
 {
 	struct Scsi_Host *host;
 	struct scsi_qla_host *vha = NULL;
 
-	host = scsi_host_alloc(sht, sizeof(scsi_qla_host_t));
+	host = scsi_host_alloc((struct scsi_host_template *) sht, sizeof(scsi_qla_host_t));
 	if (host == NULL) {
 		ql_log_pci(ql_log_fatal, ha->pdev, 0x0107,
 		    "Failed to allocate host from the scsi layer, aborting.\n");

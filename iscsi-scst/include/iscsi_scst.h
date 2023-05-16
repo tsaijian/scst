@@ -20,6 +20,12 @@
 #include <linux/uaccess.h>  /* mm_segment_t */
 #include <linux/version.h>
 
+#ifdef INSIDE_KERNEL_TREE
+#include <scst/backport.h>
+#else
+#include "backport.h"
+#endif
+
 /* <asm/uaccess.h> */
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
@@ -33,7 +39,9 @@
  * to write kernel code that is compatible with all kernel versions.
  */
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0) ||		\
+	(defined(RHEL_RELEASE_CODE) &&				\
+	 RHEL_RELEASE_CODE -0 >= RHEL_RELEASE_VERSION(9, 2))
 /*
  * Backport mm_segment_t to save compatibility with older kernel versions.
  *
@@ -62,6 +70,7 @@ static inline void set_fs(mm_segment_t seg) { }
 #include "iscsi_scst_itf_ver.h"
 
 /* The maximum length of 223 bytes in the RFC. */
+#define ISCSI_NAME_CHECK_LEN	223	/* Checked during LOGIN */
 #define ISCSI_NAME_LEN		256
 
 #define ISCSI_PORTAL_LEN	64

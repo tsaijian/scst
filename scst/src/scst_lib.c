@@ -76,7 +76,17 @@ static void scst_free_acn(struct scst_acn *acn, bool reassign);
 struct scsi_io_context {
 	void *data;
 	void (*done)(void *data, char *sense, int result, int resid);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 11, 0)
+	/*
+	 * See commit 772c8f6f3bbd ("Merge tag 'for-4.11/linus-merge-signed'
+	 * of git://git.kernel.dk/linux-block")
+	 *
+	 * Both scsi_init_rq and scsi_init_request (later renamed to
+	 * scsi_mq_init_request in e7008ff5c61a) initialize the scsi_request
+	 * sense buffer, so we don't need to (nor should) provide our own.
+	 */
 	char sense[SCST_SENSE_BUFFERSIZE];
+#endif
 };
 static struct kmem_cache *scsi_io_context_cache;
 static struct workqueue_struct *scst_release_acg_wq;
@@ -2501,6 +2511,15 @@ void scst_gen_aen_or_ua(struct scst_tgt_dev *tgt_dev,
 	    sess->shut_phase != SCST_SESS_SPH_READY)
 		goto out;
 
+	if (unlikely(test_bit(SCST_TGT_DEV_AEN_DISABLED,
+			      &tgt_dev->tgt_dev_flags))) {
+		/*
+		 * We have decided not to generate an AEN
+		 * even if supported by the transport.
+		 */
+		goto queue_ua;
+	}
+
 	if (tgtt->report_aen != NULL) {
 		struct scst_aen *aen;
 		int rc;
@@ -3099,10 +3118,6 @@ int scst_get_cmd_abnormal_done_state(struct scst_cmd *cmd)
 		PRINT_CRIT_ERROR("Wrong cmd state %d (cmd %p, op %s)",
 			cmd->state, cmd, scst_get_opcode_name(cmd));
 		sBUG();
-#if defined(RHEL_MAJOR) && RHEL_MAJOR -0 < 6
-		/* Invalid state to suppress a compiler warning */
-		res = SCST_CMD_STATE_LAST_ACTIVE;
-#endif
 	}
 
 	if (trace) {
@@ -5290,6 +5305,10 @@ static int scst_alloc_add_tgt_dev(struct scst_session *sess,
 		set_bit(SCST_TGT_DEV_FORWARD_DST, &tgt_dev->tgt_dev_flags);
 	else
 		clear_bit(SCST_TGT_DEV_FORWARD_DST, &tgt_dev->tgt_dev_flags);
+	if (sess->tgt->tgt_aen_disabled)
+		set_bit(SCST_TGT_DEV_AEN_DISABLED, &tgt_dev->tgt_dev_flags);
+	else
+		clear_bit(SCST_TGT_DEV_AEN_DISABLED, &tgt_dev->tgt_dev_flags);
 	tgt_dev->hw_dif_same_sg_layout_required = sess->tgt->tgt_hw_dif_same_sg_layout_required;
 	tgt_dev->tgt_dev_dif_guard_format = acg_dev->acg_dev_dif_guard_format;
 	if (tgt_dev->tgt_dev_dif_guard_format == SCST_DIF_GUARD_FORMAT_IP)
@@ -7037,8 +7056,8 @@ static void scst_send_release(struct scst_device *dev)
 
 		TRACE(TRACE_DEBUG | TRACE_SCSI, "%s", "Sending RELEASE req to "
 			"SCSI mid-level");
-		rc = scst_scsi_execute(scsi_dev, cdb, SCST_DATA_NONE, NULL, 0,
-				       sense, 15, 0, 0);
+		rc = scst_scsi_execute_cmd(scsi_dev, cdb, DMA_FROM_DEVICE,
+					   NULL, 0, sense, 15, 0, 0);
 		TRACE_DBG("RELEASE done: %x", rc);
 
 		if (scsi_status_is_good(rc))
@@ -7928,6 +7947,8 @@ static void blk_free_kern_sg_work(struct blk_kern_sg_work *bw)
 	return;
 }
 
+static inline void scst_free_bio(struct bio *bio);
+
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 3, 0)
 static void blk_bio_map_kern_endio(struct bio *bio, int err)
 {
@@ -7958,7 +7979,7 @@ static void blk_bio_map_kern_endio(struct bio *bio)
 		}
 	}
 
-	bio_put(bio);
+	scst_free_bio(bio);
 	return;
 }
 
@@ -8120,6 +8141,57 @@ scst_free_passthrough_request(struct request *rq)
 #endif
 }
 
+/**
+ * scst_alloc_bio - Allocate a bio.
+ * @nr_vecs: Number of bio_vecs to allocate.
+ * @gfp_mask: The GFP_* mask given to the slab allocator.
+ *
+ * Returns
+ * Pointer to new bio on success, NULL on failure.
+ */
+static inline struct bio *
+scst_alloc_bio(unsigned short nr_vecs, gfp_t gfp_mask)
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 19, 0) &&		\
+	(!defined(RHEL_RELEASE_CODE) ||				\
+	 RHEL_RELEASE_CODE -0 < RHEL_RELEASE_VERSION(9, 1))
+	return bio_kmalloc(gfp_mask, nr_vecs);
+#else
+	/*
+	 * See also commit 066ff571011d ("block: turn bio_kmalloc into a
+	 * simple kmalloc wrapper").
+	 */
+	struct bio *bio;
+
+	bio = bio_kmalloc(nr_vecs, gfp_mask);
+	if (bio)
+		bio_init(bio, NULL, bio->bi_inline_vecs, nr_vecs, 0);
+
+	return bio;
+#endif
+}
+
+/**
+ * scst_free_bio - Free a bio that was allocated with scst_alloc_bio().
+ * @bio: bio pointer.
+ */
+static inline void
+scst_free_bio(struct bio *bio)
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 19, 0) &&		\
+	(!defined(RHEL_RELEASE_CODE) ||				\
+	 RHEL_RELEASE_CODE -0 < RHEL_RELEASE_VERSION(9, 1))
+	bio_put(bio);
+#else
+	/*
+	 * See also commit 066ff571011d ("block: turn bio_kmalloc into a
+	 * simple kmalloc wrapper").
+	 */
+	bio_uninit(bio);
+	kfree(bio);
+#endif
+}
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 8, 0) ||			\
 (defined(CONFIG_SUSE_KERNEL) && LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0))
 static struct request *blk_make_request(struct request_queue *q,
@@ -8232,7 +8304,7 @@ static struct request *__blk_map_kern_sg(struct request_queue *q,
 			int rc;
 
 			if (need_new_bio) {
-				bio = bio_kmalloc(gfp_mask, max_nr_vecs);
+				bio = scst_alloc_bio(max_nr_vecs, gfp_mask);
 				if (bio == NULL) {
 					rq = ERR_PTR(-ENOMEM);
 					goto out_free_bios;
@@ -8244,7 +8316,7 @@ static struct request *__blk_map_kern_sg(struct request_queue *q,
 	LINUX_VERSION_CODE < KERNEL_VERSION(4, 4, 0)
 					bio->bi_rw |= REQ_WRITE;
 #else
-					bio_set_op_attrs(bio, REQ_OP_WRITE, 0);
+					bio->bi_opf = REQ_OP_WRITE;
 #endif
 				bios++;
 				bio->bi_private = bw;
@@ -8315,7 +8387,7 @@ out_free_bios:
 	while (hbio != NULL) {
 		bio = hbio;
 		hbio = hbio->bi_next;
-		bio_put(bio);
+		scst_free_bio(bio);
 	}
 	goto out;
 }
@@ -8497,14 +8569,16 @@ out:
 static void scsi_end_async(struct request *req, int error)
 #else
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 /*
  * See also commit de671d6116b5 ("block: change request end_io handler to pass
  * back a return value") # v6.1.
  */
-#define RQ_END_IO_RET enum rq_end_io_ret
-#else
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0) &&		\
+	(!defined(RHEL_RELEASE_CODE) ||				\
+	 RHEL_RELEASE_CODE -0 < RHEL_RELEASE_VERSION(9, 2))
 #define RQ_END_IO_RET void
+#else
+#define RQ_END_IO_RET enum rq_end_io_ret
 #endif
 
 static RQ_END_IO_RET scsi_end_async(struct request *req, blk_status_t error)
@@ -8530,6 +8604,7 @@ static RQ_END_IO_RET scsi_end_async(struct request *req, blk_status_t error)
 	if (sioc->done) {
 		int resid_len;
 		long result;
+		char *sense;
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0)
 		result = scsi_req(req)->result;
@@ -8544,16 +8619,20 @@ static RQ_END_IO_RET scsi_end_async(struct request *req, blk_status_t error)
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
 		resid_len = scsi_req(req)->resid_len;
+		sense = SREQ_SENSE(scsi_req(req));
 #else
 		resid_len = req->resid_len;
+		sense = sioc->sense;
 #endif
 
-		sioc->done(sioc->data, sioc->sense, result, resid_len);
+		sioc->done(sioc->data, sense, result, resid_len);
 	}
 
 	kmem_cache_free(scsi_io_context_cache, sioc);
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0) &&		\
+	(!defined(RHEL_RELEASE_CODE) ||				\
+	 RHEL_RELEASE_CODE -0 < RHEL_RELEASE_VERSION(9, 2))
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 21, 0) &&	\
 	(!defined(RHEL_MAJOR) || RHEL_MAJOR -0 < 8)
 	/* See also commit 92bc5a24844a ("block: remove __blk_put_request()") */
@@ -8655,8 +8734,19 @@ int scst_scsi_exec_async(struct scst_cmd *cmd, void *data,
 	memset(SREQ_CP(req), 0, MAX_COMMAND_SIZE); /* ATAPI hates garbage after CDB */
 	memcpy(SREQ_CP(req), cmd->cdb, cmd->cdb_len);
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 11, 0)
+	/*
+	 * See commit 772c8f6f3bbd ("Merge tag 'for-4.11/linus-merge-signed'
+	 * of git://git.kernel.dk/linux-block")
+	 *
+	 * Both scsi_init_rq and scsi_init_request (later renamed to
+	 * scsi_mq_init_request in e7008ff5c61a) initialize the scsi_request
+	 * sense buffer, so we don't need to (nor should) provide our own.
+	 */
 	SREQ_SENSE(req) = sioc->sense;
 	req->sense_len = sizeof(sioc->sense);
+#endif
+
 	rq->timeout = cmd->timeout;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0)
 	req->retries = cmd->retries;
@@ -13555,9 +13645,9 @@ int scst_obtain_device_parameters(struct scst_device *dev,
 		memset(sense_buffer, 0, sizeof(sense_buffer));
 
 		TRACE(TRACE_SCSI, "%s", "Doing internal MODE_SENSE");
-		rc = scst_scsi_execute(dev->scsi_dev, cmd, SCST_DATA_READ,
-				       buffer, sizeof(buffer), sense_buffer,
-				       15, 0, 0);
+		rc = scst_scsi_execute_cmd(dev->scsi_dev, cmd, DMA_FROM_DEVICE,
+					   buffer, sizeof(buffer),
+					   sense_buffer, 15, 0, 0);
 
 		TRACE_DBG("MODE_SENSE done: %x", rc);
 
@@ -14003,10 +14093,10 @@ int scst_get_max_lun_commands(struct scst_session *sess, uint64_t lun)
 
 	TRACE_ENTRY();
 
-	mutex_lock(&scst_mutex);
-
 	if (sess == NULL) {
 		struct scst_device *dev;
+
+		mutex_lock(&scst_mutex);
 
 		list_for_each_entry(dev, &scst_dev_list, dev_list_entry) {
 			if (dev->handler == &scst_null_devtype)
@@ -14016,40 +14106,48 @@ int scst_get_max_lun_commands(struct scst_session *sess, uint64_t lun)
 			if (res > dev->max_tgt_dev_commands)
 				res = dev->max_tgt_dev_commands;
 		}
-		goto out_unlock;
+
+		mutex_unlock(&scst_mutex);
+
+		goto out;
 	}
 
 	if (lun != NO_SUCH_LUN) {
-		struct list_head *head =
-			&sess->sess_tgt_dev_list[SESS_TGT_DEV_LIST_HASH_FN(lun)];
+		struct list_head *head;
 		struct scst_tgt_dev *tgt_dev;
 
-		list_for_each_entry(tgt_dev, head, sess_tgt_dev_list_entry) {
+		rcu_read_lock();
+		head = &sess->sess_tgt_dev_list[SESS_TGT_DEV_LIST_HASH_FN(lun)];
+
+		list_for_each_entry_rcu(tgt_dev, head, sess_tgt_dev_list_entry) {
 			if (tgt_dev->lun == lun) {
 				res = tgt_dev->dev->max_tgt_dev_commands;
-				TRACE_DBG("tgt_dev %p, dev %s, max_tgt_dev_commands "
-					"%d (res %d)", tgt_dev, tgt_dev->dev->virt_name,
-					tgt_dev->dev->max_tgt_dev_commands, res);
+				TRACE_DBG("tgt_dev %p, dev %s, max_tgt_dev_commands %d (res %d)",
+					  tgt_dev, tgt_dev->dev->virt_name,
+					  tgt_dev->dev->max_tgt_dev_commands, res);
 				break;
 			}
 		}
-		goto out_unlock;
+		rcu_read_unlock();
+
+		goto out;
 	}
 
+	rcu_read_lock();
 	for (i = 0; i < SESS_TGT_DEV_LIST_HASH_SIZE; i++) {
 		struct list_head *head = &sess->sess_tgt_dev_list[i];
 		struct scst_tgt_dev *tgt_dev;
 
-		list_for_each_entry(tgt_dev, head, sess_tgt_dev_list_entry) {
+		list_for_each_entry_rcu(tgt_dev, head, sess_tgt_dev_list_entry) {
 			if (res > tgt_dev->dev->max_tgt_dev_commands)
 				res = tgt_dev->dev->max_tgt_dev_commands;
 		}
 	}
+	rcu_read_unlock();
 
-out_unlock:
-	mutex_unlock(&scst_mutex);
-
+out:
 	TRACE_EXIT_RES(res);
+
 	return res;
 }
 EXPORT_SYMBOL(scst_get_max_lun_commands);
@@ -14986,8 +15084,11 @@ void scst_vfs_unlink_and_put(struct path *path)
 	vfs_unlink(path->dentry->d_parent->d_inode, path->dentry);
 #elif LINUX_VERSION_CODE < KERNEL_VERSION(5, 12, 0)
 	vfs_unlink(path->dentry->d_parent->d_inode, path->dentry, NULL);
-#else
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 3, 0)
 	vfs_unlink(&init_user_ns, path->dentry->d_parent->d_inode, path->dentry,
+		   NULL);
+#else
+	vfs_unlink(&nop_mnt_idmap, path->dentry->d_parent->d_inode, path->dentry,
 		   NULL);
 #endif
 	path_put(path);
