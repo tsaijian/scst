@@ -960,8 +960,7 @@ int istrd(void *arg)
 
 	spin_lock_bh(&p->rd_lock);
 	while (!kthread_should_stop()) {
-		wait_event_locked(p->rd_waitQ, test_rd_list(p), lock_bh,
-				  p->rd_lock);
+		scst_wait_event_interruptible_lock_bh(p->rd_waitQ, test_rd_list(p), p->rd_lock);
 		scst_do_job_rd(p);
 	}
 	spin_unlock_bh(&p->rd_lock);
@@ -1096,69 +1095,79 @@ out:
 
 static int write_data(struct iscsi_conn *conn)
 {
-	struct file *file;
-	struct kvec *iop;
 	struct socket *sock;
-	ssize_t (*sock_sendpage)(struct socket *, struct page *, int, size_t,
-				 int);
-	ssize_t (*sendpage)(struct socket *, struct page *, int, size_t, int);
-	struct iscsi_cmnd *write_cmnd = conn->write_cmnd;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0)
+	ssize_t (*sock_sendpage)(struct socket *sock, struct page *page,
+				 int offset, size_t size, int flags);
+#else
+	struct msghdr msg = {};
+	struct bio_vec bvec;
+#endif
+	struct iscsi_cmnd *write_cmnd, *parent_req;
 	struct iscsi_cmnd *ref_cmd;
 	struct page *page;
 	struct scatterlist *sg;
-	int saved_size, size, sendsize;
-	int length, offset, idx;
-	int flags, res, count, sg_size;
+	size_t saved_size, size, sg_size;
+	size_t sendsize, length;
+	int offset, idx, flags, res = 0;
 	bool ref_cmd_to_parent;
 
 	TRACE_ENTRY();
 
+	write_cmnd = conn->write_cmnd;
+	parent_req = write_cmnd->parent_req;
+
 	iscsi_extracheck_is_wr_thread(conn);
 
 	if (!write_cmnd->own_sg) {
-		ref_cmd = write_cmnd->parent_req;
+		ref_cmd = parent_req;
 		ref_cmd_to_parent = true;
 	} else {
 		ref_cmd = write_cmnd;
 		ref_cmd_to_parent = false;
 	}
 
-	req_add_to_write_timeout_list(write_cmnd->parent_req);
+	req_add_to_write_timeout_list(parent_req);
 
-	file = conn->file;
-	size = conn->write_size;
-	saved_size = size;
-	iop = conn->write_iop;
-	count = conn->write_iop_used;
+	saved_size = size = conn->write_size;
 
-	if (iop) {
-		while (1) {
-			loff_t off = 0;
-			int rest;
+	if (conn->write_iop) {
+		struct file *file = conn->file;
+		struct kvec *iop = conn->write_iop;
+		int count = conn->write_iop_used;
+		loff_t off;
 
-			sBUG_ON(count > ARRAY_SIZE(conn->write_iov));
-retry:
+		sBUG_ON(count > ARRAY_SIZE(conn->write_iov));
+
+		while (true) {
+			off = 0;
+
 			res = scst_writev(file, iop, count, &off);
 			TRACE_WRITE("sid %#Lx, cid %u, res %d, iov_len %zd",
 				    (unsigned long long)conn->session->sid,
 				    conn->cid, res, iop->iov_len);
+
 			if (unlikely(res <= 0)) {
+				if (res == -EINTR)
+					continue;
+
 				if (res == -EAGAIN) {
 					conn->write_iop = iop;
 					conn->write_iop_used = count;
 					goto out_iov;
-				} else if (res == -EINTR)
-					goto retry;
+				}
+
 				goto out_err;
 			}
 
-			rest = res;
 			size -= res;
-			while ((typeof(rest))iop->iov_len <= rest && rest) {
-				rest -= iop->iov_len;
+
+			while ((typeof(res))iop->iov_len <= res && res) {
+				res -= iop->iov_len;
 				iop++;
 				count--;
 			}
+
 			if (count == 0) {
 				conn->write_iop = NULL;
 				conn->write_iop_used = 0;
@@ -1168,8 +1177,8 @@ retry:
 			}
 			sBUG_ON(iop >
 				conn->write_iov + ARRAY_SIZE(conn->write_iov));
-			iop->iov_base += rest;
-			iop->iov_len -= rest;
+			iop->iov_base += res;
+			iop->iov_len -= res;
 		}
 	}
 
@@ -1181,15 +1190,19 @@ retry:
 	}
 
 	sock = conn->sock;
-
-	if (write_cmnd->parent_req->scst_cmd &&
-	    write_cmnd->parent_req->scst_state != ISCSI_CMD_STATE_AEN &&
-	    scst_cmd_get_dh_data_buff_alloced(write_cmnd->parent_req->scst_cmd))
-		sock_sendpage = sock_no_sendpage;
-	else
-		sock_sendpage = sock->ops->sendpage;
-
 	flags = MSG_DONTWAIT;
+
+	if (sg != write_cmnd->rsp_sg &&
+	    (!parent_req->scst_cmd || parent_req->scst_state == ISCSI_CMD_STATE_AEN ||
+	     !scst_cmd_get_dh_data_buff_alloced(parent_req->scst_cmd)))
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
+		flags |= MSG_SPLICE_PAGES;
+#else
+		sock_sendpage = sock->ops->sendpage;
+	else
+		sock_sendpage = sock_no_sendpage;
+#endif
+
 	sg_size = size;
 
 	if (sg != write_cmnd->rsp_sg) {
@@ -1202,8 +1215,8 @@ retry:
 		offset = conn->write_offset + sg[0].offset;
 		idx = offset >> PAGE_SHIFT;
 		offset &= ~PAGE_MASK;
-		length = min(size, (int)PAGE_SIZE - offset);
-		TRACE_WRITE("write_offset %d, sg_size %d, idx %d, offset %d, length %d",
+		length = min_t(size_t, size, PAGE_SIZE - offset);
+		TRACE_WRITE("write_offset %d, sg_size %lu, idx %d, offset %d, length %lu",
 			    conn->write_offset, sg_size, idx, offset, length);
 	} else {
 		/*
@@ -1218,92 +1231,72 @@ retry:
 		}
 		length = sg[idx].length - offset;
 		offset += sg[idx].offset;
-		sock_sendpage = sock_no_sendpage;
-		TRACE_WRITE("rsp_sg: write_offset %d, sg_size %d, idx %d, "
-			"offset %d, length %d", conn->write_offset, sg_size,
-			idx, offset, length);
+		TRACE_WRITE("rsp_sg: write_offset %d, sg_size %lu, idx %d, offset %d, length %lu",
+			    conn->write_offset, sg_size, idx, offset, length);
 	}
 	page = sg_page(&sg[idx]);
 
-	while (1) {
-		sendpage = sock_sendpage;
+	while (true) {
+		sendsize = min_t(size_t, size, length);
 
-		sendsize = min(size, length);
-		if (size <= sendsize) {
-retry2:
-			res = sendpage(sock, page, offset, size, flags);
-			TRACE_WRITE("Final %s sid %#Lx, cid %u, res %d (page index %lu, offset %u, size %u, cmd %p, page %p)",
-				(sendpage != sock_no_sendpage) ?
-				"sendpage" : "sock_no_sendpage",
-				(unsigned long long)conn->session->sid,
-				conn->cid, res, page->index,
-				offset, size, write_cmnd, page);
+		if (sendsize == size)
+			flags &= ~MSG_MORE;
+		else
+			flags |= MSG_MORE;
+
+		while (sendsize) {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0)
+			res = sock_sendpage(sock, page, offset, sendsize, flags);
+#else
+			memset(&msg, 0, sizeof(struct msghdr));
+			msg.msg_flags = flags;
+
+			bvec_set_page(&bvec, page, sendsize, offset);
+			iov_iter_bvec(&msg.msg_iter, ITER_SOURCE, &bvec, 1, sendsize);
+			res = sock_sendmsg(sock, &msg);
+#endif
+			TRACE_WRITE(
+	"sid %#Lx cid %u: res %d (page[%p] index %lu, offset %u, sendsize %lu, size %lu, cmd %p)",
+				    (unsigned long long)conn->session->sid, conn->cid,
+				    res, page, page->index, offset, sendsize, size,
+				    write_cmnd);
+
 			if (unlikely(res <= 0)) {
 				if (res == -EINTR)
-					goto retry2;
-				else
-					goto out_res;
+					continue;
+
+				if (res == -EAGAIN) {
+					conn->write_offset += sg_size - size;
+					goto out_iov;
+				}
+
+				goto out_err;
 			}
 
-			if (res == size) {
-				conn->write_size = 0;
-				res = saved_size;
-				goto out;
-			}
-
-			offset += res;
-			size -= res;
-			goto retry2;
-		}
-
-retry1:
-		res = sendpage(sock, page, offset, sendsize, flags | MSG_MORE);
-		TRACE_WRITE("%s sid %#Lx, cid %u, res %d (page index %lu, offset %u, sendsize %u, size %u, cmd %p, page %p)",
-			(sendpage != sock_no_sendpage) ? "sendpage" :
-							 "sock_no_sendpage",
-			(unsigned long long)conn->session->sid, conn->cid,
-			res, page->index, offset, sendsize, size,
-			write_cmnd, page);
-		if (unlikely(res <= 0)) {
-			if (res == -EINTR)
-				goto retry1;
-			else
-				goto out_res;
-		}
-
-		size -= res;
-
-		if (res == sendsize) {
-			idx++;
-			EXTRACHECKS_BUG_ON(idx >= ref_cmd->sg_cnt);
-			page = sg_page(&sg[idx]);
-			length = sg[idx].length;
-			offset = sg[idx].offset;
-		} else {
 			offset += res;
 			sendsize -= res;
-			goto retry1;
+			size -= res;
 		}
-	}
 
-out_off:
-	conn->write_offset += sg_size - size;
+		if (size == 0)
+			goto out_iov;
+
+		idx++;
+		EXTRACHECKS_BUG_ON(idx >= ref_cmd->sg_cnt);
+		page = sg_page(&sg[idx]);
+		length = sg[idx].length;
+		offset = sg[idx].offset;
+	}
 
 out_iov:
 	conn->write_size = size;
-	if ((saved_size == size) && res == -EAGAIN)
-		goto out;
 
-	res = saved_size - size;
+	if (res != -EAGAIN || saved_size != size)
+		res = saved_size - size;
 
 out:
 	TRACE_EXIT_RES(res);
 	return res;
-
-out_res:
-	if (res == -EAGAIN)
-		goto out_off;
-	/* else go through */
 
 out_err:
 #ifndef CONFIG_SCST_DEBUG
@@ -1613,8 +1606,7 @@ int istwr(void *arg)
 
 	spin_lock_bh(&p->wr_lock);
 	while (!kthread_should_stop()) {
-		wait_event_locked(p->wr_waitQ, test_wr_list(p), lock_bh,
-				  p->wr_lock);
+		scst_wait_event_interruptible_lock_bh(p->wr_waitQ, test_wr_list(p), p->wr_lock);
 		scst_do_job_wr(p);
 	}
 	spin_unlock_bh(&p->wr_lock);

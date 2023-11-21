@@ -36,10 +36,6 @@
 #endif
 #include "scst_dev_handler.h"
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
-#include <linux/sched/signal.h>
-#endif
-
 #ifndef INSIDE_KERNEL_TREE
 #if defined(CONFIG_HIGHMEM4G) || defined(CONFIG_HIGHMEM64G)
 #warning HIGHMEM kernel configurations are not supported by this module, \
@@ -1265,12 +1261,12 @@ static int dev_user_map_buf(struct scst_user_cmd *ucmd, unsigned long ubuff,
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
 	down_read(&tsk->mm->mmap_sem);
 	rc = get_user_pages(ubuff, ucmd->num_data_pages, FOLL_WRITE,
-			    ucmd->data_pages, NULL);
+			    ucmd->data_pages);
 	up_read(&tsk->mm->mmap_sem);
 #else
 	mmap_read_lock(tsk->mm);
 	rc = get_user_pages(ubuff, ucmd->num_data_pages, FOLL_WRITE,
-			    ucmd->data_pages, NULL);
+			    ucmd->data_pages);
 	mmap_read_unlock(tsk->mm);
 #endif
 
@@ -2219,8 +2215,7 @@ static inline int test_cmd_threads(struct scst_user_dev *dev, bool can_block)
 {
 	int res = !list_empty(&dev->udev_cmd_threads.active_cmd_list) ||
 		  !list_empty(&dev->ready_cmd_list) ||
-		  !can_block || !dev->blocking || dev->cleanup_done ||
-		  signal_pending(current);
+		  !can_block || !dev->blocking || dev->cleanup_done;
 	return res;
 }
 
@@ -2233,9 +2228,11 @@ static int dev_user_get_next_cmd(struct scst_user_dev *dev,
 	TRACE_ENTRY();
 
 	while (1) {
-		wait_event_locked(dev->udev_cmd_threads.cmd_list_waitQ,
-				  test_cmd_threads(dev, can_block), lock_irq,
-				  dev->udev_cmd_threads.cmd_list_lock);
+		res = scst_wait_event_interruptible_lock_irq(dev->udev_cmd_threads.cmd_list_waitQ,
+							     test_cmd_threads(dev, can_block),
+							     dev->udev_cmd_threads.cmd_list_lock);
+		if (res)
+			break;
 
 		dev_user_process_scst_commands(dev);
 
@@ -2246,12 +2243,6 @@ static int dev_user_get_next_cmd(struct scst_user_dev *dev,
 		if (!can_block || !dev->blocking || dev->cleanup_done) {
 			res = -EAGAIN;
 			TRACE_DBG("No ready commands, returning %d", res);
-			break;
-		}
-
-		if (signal_pending(current)) {
-			res = -EINTR;
-			TRACE_DBG("Signal pending, returning %d", res);
 			break;
 		}
 	}
@@ -3128,10 +3119,10 @@ static int dev_user_attach_tgt(struct scst_tgt_dev *tgt_dev)
 	if (tgtt->get_scsi_transport_version != NULL)
 		ucmd->user_cmd.sess.scsi_transport_version =
 			tgtt->get_scsi_transport_version(tgt);
-	strlcpy(ucmd->user_cmd.sess.initiator_name,
+	strscpy(ucmd->user_cmd.sess.initiator_name,
 		tgt_dev->sess->initiator_name,
 		sizeof(ucmd->user_cmd.sess.initiator_name)-1);
-	strlcpy(ucmd->user_cmd.sess.target_name,
+	strscpy(ucmd->user_cmd.sess.target_name,
 		tgt_dev->sess->tgt->tgt_name,
 		sizeof(ucmd->user_cmd.sess.target_name)-1);
 
@@ -3378,7 +3369,7 @@ static int dev_user_register_dev(struct file *file,
 
 	scst_init_threads(&dev->udev_cmd_threads);
 
-	strlcpy(dev->name, dev_desc->name, sizeof(dev->name)-1);
+	strscpy(dev->name, dev_desc->name, sizeof(dev->name)-1);
 
 	scst_init_mem_lim(&dev->udev_mem_lim);
 
@@ -4053,8 +4044,8 @@ static int dev_user_cleanup_thread(void *arg)
 
 	spin_lock(&cleanup_lock);
 	while (!kthread_should_stop()) {
-		wait_event_locked(cleanup_list_waitQ, test_cleanup_list(),
-				  lock, cleanup_lock);
+		scst_wait_event_interruptible_lock(cleanup_list_waitQ, test_cleanup_list(),
+						   cleanup_lock);
 
 		/*
 		 * We have to poll devices, because commands can go from SCST

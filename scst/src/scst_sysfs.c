@@ -470,8 +470,8 @@ static int sysfs_work_thread_fn(void *arg)
 	while (!kthread_should_stop()) {
 		if (one_time_only && !test_sysfs_work_list())
 			break;
-		wait_event_locked(sysfs_work_waitQ, test_sysfs_work_list(),
-				  lock, sysfs_work_lock);
+		scst_wait_event_interruptible_lock(sysfs_work_waitQ, test_sysfs_work_list(),
+						   sysfs_work_lock);
 		scst_process_sysfs_works();
 	}
 	spin_unlock(&sysfs_work_lock);
@@ -3805,10 +3805,10 @@ static ssize_t scst_dev_block_store(struct kobject *kobj,
 		"data_len %d)", dev->virt_name, sync, data_start, data_len);
 
 	if (sync)
-		res = scst_ext_block_dev(dev, NULL, NULL, 0, SCST_EXT_BLOCK_SYNC);
+		res = scst_sync_ext_block_dev(dev);
 	else
 		res = scst_ext_block_dev(dev, scst_sysfs_ext_blocking_done,
-					 data_start, data_len, 0);
+					 data_start, data_len, false);
 	if (res != 0)
 		goto out;
 
@@ -7701,8 +7701,8 @@ static ssize_t scst_cluster_name_show(struct kobject *kobj,
 
 	TRACE_ENTRY();
 
-	if (scst_dlm_cluster_name != NULL)
-		res = sprintf(buf, "%s\n%s", scst_dlm_cluster_name,
+	if (scst_cluster_name != NULL)
+		res = sprintf(buf, "%s\n%s", scst_cluster_name,
 			SCST_SYSFS_KEY_MARK "\n");
 
 	TRACE_EXIT_RES(res);
@@ -7726,8 +7726,8 @@ static ssize_t scst_cluster_name_store(struct kobject *kobj,
 		len--;
 
 	if (len == 0) {
-		kfree(scst_dlm_cluster_name);
-		scst_dlm_cluster_name = NULL;
+		kfree(scst_cluster_name);
+		scst_cluster_name = NULL;
 		goto out_done;
 	}
 
@@ -7737,11 +7737,11 @@ static ssize_t scst_cluster_name_store(struct kobject *kobj,
 		goto out;
 	}
 
-	kfree(scst_dlm_cluster_name);
-	scst_dlm_cluster_name = kstrndup(buf, len, GFP_KERNEL);
-	if (!scst_dlm_cluster_name) {
+	kfree(scst_cluster_name);
+	scst_cluster_name = kstrndup(buf, len, GFP_KERNEL);
+	if (!scst_cluster_name) {
 		PRINT_ERROR("Unable to alloc cluster_name string (len %d)",
-			len+1);
+			    len + 1);
 		res = -ENOMEM;
 		goto out;
 	}
@@ -8097,7 +8097,6 @@ void scst_sysfs_cleanup(void)
 	TRACE_ENTRY();
 
 	PRINT_INFO("%s", "Exiting SCST sysfs hierarchy...");
-	kfree(scst_dlm_cluster_name);
 
 	scst_del_put_sgv_kobj();
 
