@@ -4510,9 +4510,9 @@ int scst_init_thread(void *arg)
 
 	spin_lock_irq(&scst_init_lock);
 	while (!kthread_should_stop()) {
-		wait_event_locked(scst_init_cmd_list_waitQ,
-				  test_init_cmd_list(),
-				  lock_irq, scst_init_lock);
+		scst_wait_event_interruptible_lock_irq(scst_init_cmd_list_waitQ,
+						       test_init_cmd_list(),
+						       scst_init_lock);
 		scst_do_job_init();
 	}
 	spin_unlock_irq(&scst_init_lock);
@@ -4800,6 +4800,39 @@ static inline int test_cmd_threads(struct scst_cmd_thread_t *thr)
 	return res;
 }
 
+static inline int
+scst_wait_for_cmd(struct scst_cmd_threads *p_cmd_threads, struct scst_cmd_thread_t *thr)
+{
+	DEFINE_WAIT(wq_entry);
+	int ret = 0;
+
+	if (test_cmd_threads(thr))
+		return 0;
+
+	for (;;) {
+		long __int = prepare_to_wait_exclusive_head(&p_cmd_threads->cmd_list_waitQ,
+							    &wq_entry, TASK_INTERRUPTIBLE);
+
+		if (test_cmd_threads(thr))
+			break;
+
+		if (__int) {
+			ret = __int;
+			goto out;
+		}
+
+		spin_unlock(&thr->thr_cmd_list_lock);
+		spin_unlock_irq(&p_cmd_threads->cmd_list_lock);
+		schedule();
+		spin_lock_irq(&p_cmd_threads->cmd_list_lock);
+		spin_lock(&thr->thr_cmd_list_lock);
+	}
+	finish_wait(&p_cmd_threads->cmd_list_waitQ, &wq_entry);
+
+out:
+	return ret;
+}
+
 int scst_cmd_thread(void *arg)
 {
 	struct scst_cmd_thread_t *thr = arg;
@@ -4822,23 +4855,7 @@ int scst_cmd_thread(void *arg)
 	spin_lock_irq(&p_cmd_threads->cmd_list_lock);
 	spin_lock(&thr->thr_cmd_list_lock);
 	while (!kthread_should_stop()) {
-		if (!test_cmd_threads(thr)) {
-			DEFINE_WAIT(wait);
-
-			do {
-				prepare_to_wait_exclusive_head(
-					&p_cmd_threads->cmd_list_waitQ,
-					&wait, TASK_INTERRUPTIBLE);
-				if (test_cmd_threads(thr))
-					break;
-				spin_unlock(&thr->thr_cmd_list_lock);
-				spin_unlock_irq(&p_cmd_threads->cmd_list_lock);
-				schedule();
-				spin_lock_irq(&p_cmd_threads->cmd_list_lock);
-				spin_lock(&thr->thr_cmd_list_lock);
-			} while (!test_cmd_threads(thr));
-			finish_wait(&p_cmd_threads->cmd_list_waitQ, &wait);
-		}
+		scst_wait_for_cmd(p_cmd_threads, thr);
 
 		if (tm_dbg_is_release()) {
 			spin_unlock_irq(&p_cmd_threads->cmd_list_lock);
@@ -6794,9 +6811,9 @@ int scst_tm_thread(void *arg)
 
 	spin_lock_irq(&scst_mcmd_lock);
 	while (!kthread_should_stop()) {
-		wait_event_locked(scst_mgmt_cmd_list_waitQ,
-				  test_mgmt_cmd_list(), lock_irq,
-				  scst_mcmd_lock);
+		scst_wait_event_interruptible_lock_irq(scst_mgmt_cmd_list_waitQ,
+						       test_mgmt_cmd_list(),
+						       scst_mcmd_lock);
 
 		while (!list_empty(&scst_active_mgmt_cmd_list)) {
 			int rc;
@@ -7610,8 +7627,8 @@ int scst_global_mgmt_thread(void *arg)
 
 	spin_lock_irq(&scst_mgmt_lock);
 	while (!kthread_should_stop()) {
-		wait_event_locked(scst_mgmt_waitQ, test_mgmt_list(), lock_irq,
-				  scst_mgmt_lock);
+		scst_wait_event_interruptible_lock_irq(scst_mgmt_waitQ, test_mgmt_list(),
+						       scst_mgmt_lock);
 
 		while (!list_empty(&scst_sess_init_list)) {
 			sess = list_first_entry(&scst_sess_init_list,

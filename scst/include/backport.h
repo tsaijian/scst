@@ -31,6 +31,7 @@
 #include <linux/blk-mq.h>
 #endif
 #include <linux/bsg-lib.h>	/* struct bsg_job */
+#include <linux/debugfs.h>
 #include <linux/dmapool.h>
 #include <linux/eventpoll.h>
 #include <linux/iocontext.h>
@@ -177,7 +178,9 @@ enum {
 };
 #endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0) &&		\
+	(!defined(RHEL_RELEASE_CODE) ||				\
+	 RHEL_RELEASE_CODE -0 < RHEL_RELEASE_VERSION(9, 2))
 /*
  * See also commit 342a72a33407 ("block: Introduce the type blk_opf_t") # v6.0
  */
@@ -228,6 +231,55 @@ void blk_execute_rq_nowait_backport(struct request *rq, bool at_head)
 
 /* <linux/blkdev.h> */
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0)
+/*
+ * See also commit 05bdb9965305 ("block: replace fmode_t with a block-specific
+ * type for block open flags") # v6.5.
+ */
+typedef fmode_t blk_mode_t;
+
+#define BLK_OPEN_READ ((__force blk_mode_t)FMODE_READ)
+#define BLK_OPEN_WRITE ((__force blk_mode_t)FMODE_WRITE)
+#define BLK_OPEN_EXCL ((__force blk_mode_t)FMODE_EXCL)
+
+/*
+ * See also commit 0718afd47f70 ("block: introduce holder ops") # v6.5.
+ */
+struct blk_holder_ops {
+	/* empty dummy */
+};
+
+static inline struct block_device *
+blkdev_get_by_path_backport(const char *path, blk_mode_t mode,
+		void *holder, const struct blk_holder_ops *hops)
+{
+	WARN_ON_ONCE(hops);
+
+	/*
+	 * See also commit 2736e8eeb0cc ("block: use the holder as
+	 * indication for exclusive opens") # v6.5.
+	 */
+	if (holder)
+		mode |= BLK_OPEN_EXCL;
+
+	return blkdev_get_by_path(path, mode, holder);
+}
+
+#define blkdev_get_by_path blkdev_get_by_path_backport
+
+/*
+ * See also commit 2736e8eeb0cc ("block: use the holder as indication for
+ * exclusive opens") # v6.5.
+ */
+static inline void blkdev_put_backport(struct block_device *bdev, void *holder)
+{
+	blkdev_put(bdev, holder ? BLK_OPEN_EXCL : 0);
+}
+
+#define blkdev_put blkdev_put_backport
+
+#endif
+
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 19, 0) &&		\
 	(!defined(RHEL_RELEASE_CODE) ||				\
 	 RHEL_RELEASE_CODE -0 < RHEL_RELEASE_VERSION(9, 1))
@@ -235,8 +287,8 @@ void blk_execute_rq_nowait_backport(struct request *rq, bool at_head)
  * See also commit 44abff2c0b97 ("block: decouple REQ_OP_SECURE_ERASE
  * from REQ_OP_DISCARD") # v5.19.
  */
-static inline
-int blkdev_issue_discard_backport(struct block_device *bdev, sector_t sector,
+static inline int
+blkdev_issue_discard_backport(struct block_device *bdev, sector_t sector,
 		sector_t nr_sects, gfp_t gfp_mask)
 {
 	return blkdev_issue_discard(bdev, sector, nr_sects, gfp_mask, 0);
@@ -332,6 +384,39 @@ static inline ssize_t debugfs_attr_write(struct file *file,
 {
 	return -ENOENT;
 }
+#endif
+
+/*
+ * See also commit ff9fb72bc077 ("debugfs: return error values,
+ * not NULL") # v5.0.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+static inline struct dentry *debugfs_create_dir_backport(const char *name, struct dentry *parent)
+{
+	struct dentry *dentry;
+
+	dentry = debugfs_create_dir(name, parent);
+	if (!dentry)
+		return ERR_PTR(-ENOMEM);
+
+	return dentry;
+}
+
+static inline struct dentry *debugfs_create_file_backport(const char *name, umode_t mode,
+							  struct dentry *parent, void *data,
+							  const struct file_operations *fops)
+{
+	struct dentry *dentry;
+
+	dentry = debugfs_create_file(name, mode, parent, data, fops);
+	if (!dentry)
+		return ERR_PTR(-ENOMEM);
+
+	return dentry;
+}
+
+#define debugfs_create_dir debugfs_create_dir_backport
+#define debugfs_create_file debugfs_create_file_backport
 #endif
 
 /* <linux/device.h> */
@@ -523,60 +608,49 @@ static inline u32 int_sqrt64(u64 x)
 }
 #endif
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0)
+static inline long get_user_pages_backport(unsigned long start,
+					   unsigned long nr_pages,
+					   unsigned int gup_flags,
+					   struct page **pages)
+{
 #if LINUX_VERSION_CODE >> 8 == KERNEL_VERSION(4, 4, 0) >> 8 &&	\
 	LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 168)
-/*
- * See also commit 8e50b8b07f46 ("mm: replace get_user_pages() write/force
- * parameters with gup_flags") # v4.4.168.
- */
-static inline long get_user_pages_backport(unsigned long start,
-					   unsigned long nr_pages,
-					   unsigned int gup_flags,
-					   struct page **pages,
-					   struct vm_area_struct **vmas)
-{
+	/*
+	 * See also commit 8e50b8b07f46 ("mm: replace get_user_pages() write/force
+	 * parameters with gup_flags") # v4.4.168.
+	 */
 	return get_user_pages(current, current->mm, start, nr_pages, gup_flags,
-			      pages, vmas);
-}
-#define get_user_pages get_user_pages_backport
-#elif !defined(CONFIG_SUSE_KERNEL) &&				\
-	LINUX_VERSION_CODE < KERNEL_VERSION(4, 6, 0)
-/*
- * See also commit cde70140fed8 ("mm/gup: Overload get_user_pages() functions")
- * # v4.6.
- */
-static inline long get_user_pages_backport(unsigned long start,
-					   unsigned long nr_pages,
-					   unsigned int gup_flags,
-					   struct page **pages,
-					   struct vm_area_struct **vmas)
-{
-	const bool write = gup_flags & FOLL_WRITE;
-	const bool force = 0;
-
-	WARN_ON_ONCE(gup_flags & ~FOLL_WRITE);
-	return get_user_pages(current, current->mm, start, nr_pages, write,
-			      force, pages, vmas);
-}
-#define get_user_pages get_user_pages_backport
+			      pages, NULL);
 #elif (!defined(CONFIG_SUSE_KERNEL) &&				\
 	LINUX_VERSION_CODE < KERNEL_VERSION(4, 9, 0)) ||	\
 	LINUX_VERSION_CODE < KERNEL_VERSION(4, 4, 0)
-/*
- * See also commit 768ae309a961 ("mm: replace get_user_pages() write/force
- * parameters with gup_flags") # v4.9.
- */
-static inline long get_user_pages_backport(unsigned long start,
-					   unsigned long nr_pages,
-					   unsigned int gup_flags,
-					   struct page **pages,
-					   struct vm_area_struct **vmas)
-{
 	const bool write = gup_flags & FOLL_WRITE;
 	const bool force = 0;
 
 	WARN_ON_ONCE(gup_flags & ~FOLL_WRITE);
-	return get_user_pages(start, nr_pages, write, force, pages, vmas);
+#if !defined(CONFIG_SUSE_KERNEL) &&				\
+	LINUX_VERSION_CODE < KERNEL_VERSION(4, 6, 0)
+	/*
+	 * See also commit cde70140fed8 ("mm/gup: Overload get_user_pages() functions")
+	 * # v4.6.
+	 */
+	return get_user_pages(current, current->mm, start, nr_pages, write,
+			      force, pages, NULL);
+#else
+	/*
+	 * See also commit 768ae309a961 ("mm: replace get_user_pages() write/force
+	 * parameters with gup_flags") # v4.9.
+	 */
+	return get_user_pages(start, nr_pages, write, force, pages, NULL);
+#endif
+#else
+	/*
+	 * See also commit 54d020692b34 ("mm/gup: remove unused vmas parameter from
+	 * get_user_pages()") # v6.5.
+	 */
+	return get_user_pages(start, nr_pages, gup_flags, pages, NULL);
+#endif
 }
 #define get_user_pages get_user_pages_backport
 #endif
@@ -646,6 +720,19 @@ static inline bool list_entry_in_list(const struct list_head *entry)
 {
 	return !list_empty(entry);
 }
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 1, 0) &&		\
+	(!defined(RHEL_RELEASE_CODE) ||				\
+	 RHEL_RELEASE_CODE -0 < RHEL_RELEASE_VERSION(8, 1))
+/*
+ * See also commit 70b44595eafe ("mm, compaction: use free lists to quickly
+ * locate a migration source") # v5.1.
+ */
+static inline int list_is_first(const struct list_head *list, const struct list_head *head)
+{
+	return list->prev == head;
+}
+#endif
 
 /* <linux/lockdep.h> */
 
@@ -796,15 +883,39 @@ static inline void kvfree(void *addr)
 }
 #endif
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0) &&			\
+	(LINUX_VERSION_CODE >> 8 != KERNEL_VERSION(5, 15, 0) >> 8 ||	\
+	 LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 54)) &&		\
+	(!defined(RHEL_RELEASE_CODE) ||					\
+	 RHEL_RELEASE_CODE -0 < RHEL_RELEASE_VERSION(9, 0)) &&		\
+	(!defined(UEK_KABI_RENAME) ||					\
+	 LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0))
+/*
+ * See also commit a8749a35c3990 ("mm: vmalloc: introduce array allocation functions") # v5.18,
+ * v5.15.54.
+ */
+static inline void *vmalloc_array(size_t n, size_t size)
+{
+	return vmalloc(n * size);
+}
+
+static inline void *vcalloc(size_t n, size_t size)
+{
+	return vzalloc(n * size);
+}
+#endif
+
 /* <linux/shrinker.h> */
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0) &&		\
+	(!defined(RHEL_RELEASE_CODE) ||				\
+	 RHEL_RELEASE_CODE -0 < RHEL_RELEASE_VERSION(9, 3))
 /*
  * See also commit e33c267ab70d ("mm: shrinkers: provide shrinkers with
  * names") # v6.0.
  */
-static inline
-int register_shrinker_backport(struct shrinker *shrinker, const char *fmt, ...)
+static inline int
+register_shrinker_backport(struct shrinker *shrinker, const char *fmt, ...)
 {
 /*
  * See also commit 1d3d4437eae1 ("vmscan: per-node deferred work") # v3.12
@@ -1096,11 +1207,19 @@ static inline void percpu_ref_put(struct percpu_ref *ref)
 		ref->release(ref);
 }
 
-static inline void percpu_ref_kill(struct percpu_ref *ref)
+static inline void
+percpu_ref_kill_and_confirm(struct percpu_ref *ref, percpu_ref_func_t *confirm_kill)
 {
 	WARN_ON_ONCE(ref->dead);
 	ref->dead = true;
+	if (confirm_kill)
+		confirm_kill(ref);
 	percpu_ref_put(ref);
+}
+
+static inline void percpu_ref_kill(struct percpu_ref *ref)
+{
+	percpu_ref_kill_and_confirm(ref, NULL);
 }
 
 static inline void percpu_ref_resurrect(struct percpu_ref *ref)
@@ -1251,6 +1370,14 @@ static inline void __user *KERNEL_SOCKPTR(void *p)
 #define sizeof_field(TYPE, MEMBER) sizeof((((TYPE *)0)->MEMBER))
 #endif
 
+#ifndef DECLARE_FLEX_ARRAY
+#define DECLARE_FLEX_ARRAY(TYPE, NAME)	\
+	struct { \
+		struct { } __empty_ ## NAME; \
+		TYPE NAME[]; \
+	}
+#endif
+
 /* <linux/string.h> */
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 5, 0) &&	\
@@ -1271,6 +1398,29 @@ static inline void *memdup_user_nul(const void __user *src, size_t len)
 	p[len] = '\0';
 
 	return p;
+}
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 3, 0) &&			\
+	(LINUX_VERSION_CODE >> 8 != KERNEL_VERSION(3, 16, 0) >> 8 ||	\
+	 LINUX_VERSION_CODE < KERNEL_VERSION(3, 16, 60)) &&		\
+	(LINUX_VERSION_CODE >> 8 != KERNEL_VERSION(3, 18, 0) >> 8 ||	\
+	 LINUX_VERSION_CODE < KERNEL_VERSION(3, 18, 64)) &&		\
+	(!defined(RHEL_RELEASE_CODE) ||					\
+	 RHEL_RELEASE_CODE -0 < RHEL_RELEASE_VERSION(7, 7))
+/*
+ * See also commit 30035e45753b ("string: provide strscpy()") # v4.3, v3.16.60, v3.18.64.
+ */
+static inline ssize_t strscpy(char *dest, const char *src, size_t count)
+{
+	size_t ret;
+
+	if (count == 0)
+		return -E2BIG;
+
+	ret = strlcpy(dest, src, count);
+
+	return ret >= count ? -E2BIG : ret;
 }
 #endif
 
@@ -1644,7 +1794,9 @@ enum {
 #define wwn_to_u64(wwn) get_unaligned_be64(wwn)
 #endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 3, 0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 3, 0) &&		\
+	(!defined(RHEL_RELEASE_CODE) ||				\
+	 RHEL_RELEASE_CODE -0 < RHEL_RELEASE_VERSION(9, 3))
 /*
  * See also commit 64fd2ba977b1 ("scsi: scsi_transport_fc: Add an additional
  * flag to fc_host_fpin_rcv()") # v6.3

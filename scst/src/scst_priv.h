@@ -172,11 +172,10 @@ extern struct list_head scst_template_list;
 extern struct list_head scst_dev_list;
 extern struct list_head scst_dev_type_list;
 extern struct list_head scst_virtual_dev_type_list;
-extern wait_queue_head_t scst_dev_cmd_waitQ;
 
 extern const struct scst_cl_ops scst_no_dlm_cl_ops;
 extern const struct scst_cl_ops scst_dlm_cl_ops;
-extern char *scst_dlm_cluster_name;
+extern char *scst_cluster_name;
 
 extern unsigned int scst_setup_id;
 
@@ -418,7 +417,7 @@ static inline int scst_dlm_new_lockspace(const char *name, int namelen,
 					 uint32_t flags,
 					 int lvblen)
 {
-	return dlm_new_lockspace(name, scst_dlm_cluster_name, flags, lvblen,
+	return dlm_new_lockspace(name, scst_cluster_name, flags, lvblen,
 				 NULL, NULL, NULL, lockspace);
 }
 
@@ -611,12 +610,10 @@ bool __scst_check_blocked_dev(struct scst_cmd *cmd);
 void __scst_check_unblock_dev(struct scst_cmd *cmd);
 void scst_check_unblock_dev(struct scst_cmd *cmd);
 
-#define SCST_EXT_BLOCK_SYNC	1
-#define SCST_EXT_BLOCK_STPG	2
+int scst_sync_ext_block_dev(struct scst_device *dev);
 int scst_ext_block_dev(struct scst_device *dev, ext_blocker_done_fn_t done_fn,
-	const uint8_t *priv, int priv_len, int flags);
+		       const void *priv, size_t priv_len, bool block_stpg);
 void scst_ext_unblock_dev(struct scst_device *dev, bool stpg);
-void __scst_ext_blocking_done(struct scst_device *dev);
 void scst_ext_blocking_done(struct scst_device *dev);
 
 int scst_get_suspend_count(void);

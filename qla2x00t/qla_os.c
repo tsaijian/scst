@@ -450,7 +450,7 @@ static int qla25xx_setup_mode(struct scsi_qla_host *vha)
 			    "Failed to create request queue.\n");
 			goto fail;
 		}
-		ha->wq = alloc_workqueue("qla2xxx_wq", WQ_MEM_RECLAIM, 0);
+		ha->wq = alloc_workqueue("qla2xxx_wq", WQ_MEM_RECLAIM, 1);
 		vha->req = ha->req_q_map[req];
 		options |= BIT_1;
 		for (ques = 1; ques < ha->max_rsp_queues; ques++) {
@@ -494,7 +494,7 @@ qla2x00_pci_info_str(struct scsi_qla_host *vha, char *str, int str_len)
 	};
 	uint16_t pci_bus;
 
-	strlcpy(str, "PCI", str_len);
+	strscpy(str, "PCI", str_len);
 	pci_bus = (ha->pci_attr & (BIT_9 | BIT_10)) >> 9;
 	if (pci_bus) {
 		strncat(str, "-X (", str_len - (strlen(str)+1));
@@ -2367,8 +2367,10 @@ qla2x00_probe_one(struct pci_dev *pdev, const struct pci_device_id *id)
 			goto probe_out;
 	}
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0)
 	/* This may fail but that's ok */
 	pci_enable_pcie_error_reporting(pdev);
+#endif
 
 	ha = kzalloc(sizeof(struct qla_hw_data), GFP_KERNEL);
 	if (!ha) {
@@ -3020,7 +3022,9 @@ qla2x00_remove_one(struct pci_dev *pdev)
 	kfree(ha);
 	ha = NULL;
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0)
 	pci_disable_pcie_error_reporting(pdev);
+#endif
 	pci_disable_device(pdev);
 	pci_set_drvdata(pdev, NULL);
 }

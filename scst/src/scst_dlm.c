@@ -304,11 +304,10 @@ static int scst_copy_from_dlm(struct scst_device *dev, dlm_lockspace_t *ls,
 
 	nr_registrants = be32_to_cpu(lvb->nr_registrants);
 	if (nr_registrants) {
-		reg_lksb = vzalloc((sizeof(*reg_lksb) + PR_DLM_LVB_LEN) *
-				   nr_registrants);
+		reg_lksb = vcalloc(nr_registrants, sizeof(*reg_lksb) + PR_DLM_LVB_LEN);
 		if (!reg_lksb) {
-			PRINT_ERROR("%s: failed to allocate %d * %zd bytes of"
-				    " memory", __func__, nr_registrants,
+			PRINT_ERROR("%s: failed to allocate %u * %zu bytes of memory",
+				    __func__, nr_registrants,
 				    sizeof(*reg_lksb) + PR_DLM_LVB_LEN);
 			goto out;
 		}
@@ -1830,7 +1829,5 @@ const struct scst_cl_ops scst_dlm_cl_ops = {
 	.reserve		= scst_dlm_reserve,
 	.pr_reg_queue_rem_ua	= scst_dlm_pr_reg_queue_rem_ua,
 };
-
-char *scst_dlm_cluster_name;
 
 #endif
